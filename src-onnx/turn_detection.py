@@ -1,9 +1,4 @@
-"""Acoustic turn completion, independent of LFM3 and its GPU lock.
-
-Smart Turn v3.2 uses Whisper Tiny features for the last eight seconds of audio.
-The integration follows Parlor's use of Pipecat's classifier, while feature
-extraction uses the upstream Transformers implementation already in this app.
-"""
+"""Smart Turn v3.2 on CPU with a NumPy Whisper frontend."""
 
 from __future__ import annotations
 
@@ -28,7 +23,7 @@ WINDOW_SAMPLES = SAMPLE_RATE * 8
 class SmartTurn:
     def __init__(self, path: str):
         import onnxruntime as ort
-        from transformers import WhisperFeatureExtractor
+        from lfm3_onnx.preprocessing import whisper_features
 
         options = ort.SessionOptions()
         options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
@@ -37,7 +32,7 @@ class SmartTurn:
         self.session = ort.InferenceSession(
             path, sess_options=options, providers=["CPUExecutionProvider"],
         )
-        self.features = WhisperFeatureExtractor(chunk_length=8)
+        self.features = whisper_features
         self.lock = threading.Lock()
 
     def predict(self, pcm: bytes) -> float:
@@ -48,11 +43,7 @@ class SmartTurn:
         if audio.size < WINDOW_SAMPLES:
             audio = np.pad(audio, (WINDOW_SAMPLES - audio.size, 0))
         with self.lock:
-            features = self.features(
-                audio, sampling_rate=SAMPLE_RATE, return_tensors="np",
-                do_normalize=True, padding="max_length", max_length=WINDOW_SAMPLES,
-                truncation=True,
-            ).input_features
+            features = self.features(audio)
             outputs = self.session.run(None, {"input_features": features})
         probability = float(np.asarray(outputs[0]).reshape(-1)[0])
         if not np.isfinite(probability) or not 0 <= probability <= 1:

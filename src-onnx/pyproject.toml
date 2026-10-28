@@ -1,0 +1,37 @@
+[project]
+name = "lfm3-chat-onnx"
+version = "0.1.0"
+description = "Camera and voice chat with LFM3 Omni ONNX q4 and q4f16"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi", "huggingface-hub", "jinja2", "numpy", "pillow",
+    "tokenizers", "uvicorn", "websockets",
+]
+
+[project.optional-dependencies]
+cpu = ["onnxruntime>=1.30.0"]
+gpu = ["onnxruntime-gpu[cuda,cudnn]>=1.30.0"]
+
+[project.scripts]
+serve = "serve:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = ["httpx", "pytest", "ruff"]
+
+[tool.uv]
+package = true
+conflicts = [[{extra = "cpu"}, {extra = "gpu"}]]
+
+[tool.hatch.build]
+dev-mode-dirs = ["."]
+
+[tool.hatch.build.targets.wheel]
+only-include = ["serve.py", "turn_detection.py", "lfm3_onnx", "web"]
+
+[tool.hatch.build.targets.sdist]
+only-include = ["serve.py", "turn_detection.py", "lfm3_onnx", "web", "pyproject.toml", "README.md"]

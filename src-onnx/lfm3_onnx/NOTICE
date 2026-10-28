@@ -1,0 +1,6 @@
+Runtime generation and cache code adapted from Liquid4All/onnx-export.
+Copyright Liquid AI. Licensed under the LFM Open License v1.0; see LICENSE.liquidonnx.
+Source: https://github.com/Liquid4All/onnx-export
+Revision: 0280214f68565c93ff8f72cf2120a24d55c259dc
+Adaptations: local configuration and NumPy preprocessing, selective downloads,
+CPU/CUDA profiles, streaming integration, cancellation.

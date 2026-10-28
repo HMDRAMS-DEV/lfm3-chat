@@ -4,9 +4,12 @@ Talk to [LFM3-Omni-2B](https://huggingface.co/LiquidAI/LFM3-Omni-2B) through you
 microphone and camera. The model replies with text and audio, and you can
 interrupt it by speaking or pressing a button.
 
-Run the server on your own computer and open the chat in a browser. You can also
-connect from a laptop or phone over HTTPS. A supported GPU on the server is
-recommended for conversation speed.
+Start the server and open http://localhost:8000 on the same computer.
+Camera and microphone access on localhost works without SSL certificates.
+
+An [ONNX version](src-onnx/README.md) is available in `src-onnx/`, with a separate
+uv environment. Use `q4` for CPU or `q4f16` for NVIDIA GPU. It supports the same
+camera, voice, and interruption controls without installing PyTorch.
 
 ## Get started
 
@@ -16,7 +19,7 @@ You need [uv](https://docs.astral.sh/uv/) and a microphone. The project uses Pyt
 Install the dependencies:
 
 ```bash
-uv sync --locked
+uv sync
 ```
 
 Already downloaded the model? Skip the next command and use your existing folder
@@ -105,8 +108,8 @@ https://192.168.0.124:8888/ there. The browser automatically uses a secure WebSo
 for audio and video frames. If the page cannot connect, check that the server's
 firewall allows your chosen port.
 
-Both certificate flags are required together. `cert.pem` and `key.pem` are ignored
-by Git. Never share the private key.
+Both certificate flags are required together. `cert.pem` and `key.pem` are
+ignored by Git. Keep the private key private.
 
 ## Development checks and preview
 

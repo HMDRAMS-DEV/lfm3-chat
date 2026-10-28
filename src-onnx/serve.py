@@ -1,31 +1,14 @@
 #!/usr/bin/env python3
-"""Local camera and voice chat with LiquidAI/LFM3-Omni-2B.
+"""Camera and voice chat with LFM3 Omni ONNX.
 
-Run after the model download finishes:
-    uv run serve
-    uv run serve --model /path/to/LFM3-Omni-2B
+CPU: uv run --project src-onnx --extra cpu serve --device cpu --precision q4
+GPU: uv run --project src-onnx --extra gpu serve --device cuda --precision q4f16
 
-Then open http://localhost:8000 and allow camera/microphone access. A WebSocket
-streams 16 kHz PCM microphone packets and camera frames to the server. After a
-pause, the model answers with streamed text and 24 kHz PCM audio. Click Interrupt
-& speak to stop a reply, or enable voice interruption when using headphones.
-The model processes each completed utterance; incoming audio is buffered until
-the turn ends. Smart Turn v3 can hold thinking pauses without cutting you off.
-No separate ASR or TTS model.
-
-Only cached model files are used by default. --download permits Hugging Face
-downloads. Custom model code is loaded with trust_remote_code=True, as required
-by this checkpoint. --ui-only serves the interface without loading weights.
-
-To serve HTTPS, pass --ssl-certfile cert.pem --ssl-keyfile key.pem. Use a
-certificate trusted by the browser when accessing the camera from another device.
-The browser automatically uses a secure WebSocket when the page uses HTTPS.
-
-Use --turn-detector smart --download once to fetch Smart Turn v3.2 into
-resources/models/smart-turn-v3/. Later runs reuse it without downloading.
-The default auto mode uses cached Smart Turn, or falls back to silence detection.
-
-Model API: https://huggingface.co/LiquidAI/LFM3-Omni-2B
+Use --download once to cache only the selected bundle in resources/models/.
+The WebSocket carries 16 kHz PCM microphone audio, camera JPEGs, streamed text,
+and 24 kHz reply audio. Utterances are buffered until their turn ends.
+Pass --ssl-certfile cert.pem --ssl-keyfile key.pem for camera/mic over LAN HTTPS.
+--ui-only serves the interface without loading weights or importing ONNX Runtime.
 """
 
 from __future__ import annotations
@@ -34,7 +17,6 @@ import argparse
 import asyncio
 import base64
 import binascii
-import importlib
 import io
 import json
 import logging
@@ -81,80 +63,8 @@ def pcm_wav(pcm: bytes, rate: int) -> bytes:
     return buffer.getvalue()
 
 
-def waveform_pcm(waveform) -> bytes:
-    import numpy as np
-
-    samples = waveform.detach().float().cpu().numpy().reshape(-1)
-    if not np.isfinite(samples).all():
-        raise RuntimeError("The audio decoder returned an invalid waveform.")
-    return (np.clip(samples, -1, 1) * 32767).astype("<i2").tobytes()
-
-
 class GenerationCancelled(Exception):
     """Stop at the next model callback, including during speech generation."""
-
-
-class ReplyStream:
-    """Decode incremental codec frames while keeping its overlap and KV cache."""
-
-    def __init__(self, engine, emit, cancel):
-        self.engine, self.emit, self.cancel = engine, emit, cancel
-        self.cache = engine.codec_cache_class(engine.codec.config)
-        self.pending, self.pcm = [], []
-        self.last_frame = None
-        self.finished = False
-
-    def check(self):
-        if self.cancel.is_set():
-            raise GenerationCancelled
-
-    def put(self, codes):
-        self.check()
-        self.last_frame = codes
-        self.pending.append(codes)
-        if len(self.pending) >= 4:  # Four codec frames represent 320 ms of speech.
-            self.flush(finalize=False)
-
-    def flush(self, finalize):
-        self.check()
-        if self.last_frame is None:
-            return
-        codes = (self.engine.torch.stack(self.pending, dim=-1).unsqueeze(0) if self.pending
-                 else self.last_frame.new_empty((1, self.last_frame.numel(), 0)))
-        self.pending.clear()
-        with self.engine.torch.inference_mode():
-            output = self.engine.codec.decode(codes, streaming_cache=self.cache, finalize=finalize)
-        pcm = waveform_pcm(output.audio_values[0])
-        if pcm:
-            self.pcm.append(pcm)
-            self.emit({"type": "audio", "pcm": pcm})
-
-    def end(self):
-        if not self.finished:
-            self.finished = True
-            self.flush(finalize=True)
-
-
-class TextStream:
-    def __init__(self, processor, emit, cancel):
-        self.processor, self.emit, self.cancel = processor, emit, cancel
-        self.prompt = True
-        self.tokens, self.text = [], ""
-
-    def put(self, tokens):
-        if self.cancel.is_set():
-            raise GenerationCancelled
-        if self.prompt:
-            self.prompt = False
-            return
-        self.tokens.extend(tokens.reshape(-1).tolist())
-        text = self.processor.decode(self.tokens, skip_special_tokens=True).replace("<think></think>", "").strip()
-        if text != self.text and not text.endswith("\ufffd"):
-            self.text = text
-            self.emit({"type": "text", "text": text})
-
-    def end(self):
-        pass
 
 
 def decode_base64(value: object, limit: int) -> bytes:
@@ -247,34 +157,30 @@ class Engine:
         self.ready = False
         self.turn_detector = None
         self.device = "unloaded"
+        self.precision = args.precision
 
     def load(self):
-        import torch
-        from transformers import AutoModelForMultimodalLM, AutoProcessor
+        try:
+            import onnxruntime as ort
+        except ImportError as exc:
+            raise RuntimeError(
+                "Choose a runtime: uv run --project src-onnx --extra cpu serve "
+                "or use --extra gpu on the GPU machine."
+            ) from exc
+        from lfm3_onnx.model import OmniModel, choose_device_precision, resolve_model
 
-        self.torch = torch
-        device = self.args.device
-        if device == "auto":
-            device = "cuda" if torch.cuda.is_available() else (
-                "mps" if torch.backends.mps.is_available() else "cpu"
-            )
-        dtype = self.args.dtype
-        if dtype == "auto":
-            dtype = ("bfloat16" if torch.cuda.is_bf16_supported() else "float16") if device.startswith("cuda") else "float32"
-        self.device = device
-        kwargs = {"trust_remote_code": True, "local_files_only": not self.args.download}
-        LOG.info("Loading %s on %s with %s", self.args.model, device, dtype)
-        self.model = AutoModelForMultimodalLM.from_pretrained(
-            self.args.model, dtype=getattr(torch, dtype), device_map=device, **kwargs,
-        ).eval()
-        self.processor = AutoProcessor.from_pretrained(self.args.model, **kwargs)
-        # The codec stays in its own float32 dtype, as in Liquid AI's example.
-        self.codec = self.processor.audio_tokenizer.to(device=device).eval()
-        self.codec_cache_class = importlib.import_module(type(self.codec).__module__).LiquidCodecStreamingCache
-        self.context_length = getattr(self.model.config, "max_position_embeddings", 32768)
+        self.device, self.precision = choose_device_precision(
+            self.args.device, self.args.precision, ort.get_available_providers(),
+        )
+        folder = resolve_model(self.args.model, self.precision, self.args.download)
+        LOG.info("Loading %s on %s with %s", folder, self.device, self.precision)
+        self.model = OmniModel(folder, precision=self.precision, force_cpu=self.device == "cpu", tf32=False)
+        self.model.load_sessions(ep=self.device)
+        self.model.load_preprocessing()
+        self.context_length = min(self.model.config.language.max_position_embeddings, 32768)
         self.turn_detector = load_turn_detector(self.args)
         self.ready = True
-        LOG.info("Model ready")
+        LOG.info("ONNX model ready")
 
     def close(self):
         for session in self.sessions.values():
@@ -315,7 +221,15 @@ class Engine:
                 raise GenerationCancelled
             started = time.monotonic()
             session = self.get_session(session_id)
-            directory = tempfile.TemporaryDirectory(prefix="lfm3-turn-")
+            from lfm3_onnx.model import PROJECT_ROOT
+
+            turns_dir = PROJECT_ROOT / "resources/turns"
+            turns_dir.mkdir(parents=True, exist_ok=True)
+            directory = tempfile.TemporaryDirectory(prefix="lfm3-onnx-turn-", dir=turns_dir)
+
+            def check():
+                if cancel.is_set():
+                    raise GenerationCancelled
             root = Path(directory.name)
             audio_path = root / "user.wav"
             audio_path.write_bytes(audio)
@@ -336,45 +250,15 @@ class Engine:
                 for turn in session.turns:
                     conversation.extend([turn.user, turn.assistant])
                 conversation.append(user)
-                inputs = self.processor.apply_chat_template(
-                    conversation, add_generation_prompt=True, tokenize=True,
-                    return_dict=True, return_tensors="pt",
-                )
-                prompt_length = inputs["input_ids"].shape[1]
+                inputs = self.model.prepare(conversation, check=check)
+                prompt_length = len(inputs["input_ids"]) + 1  # Interleaved mode marker.
                 if prompt_length + self.args.max_new_tokens <= self.context_length:
                     break
                 del inputs
                 if not session.turns:
                     raise HTTPException(413, "This turn exceeds the model context. Try a shorter recording.")
                 session.turns.pop(0).directory.cleanup()
-            inputs = inputs.to(self.device)
-            speech = ReplyStream(self, emit, cancel) if emit else None
-            streaming = ({"audio_streamer": speech, "streamer": TextStream(self.processor, emit, cancel)}
-                         if emit else {})
-            with self.torch.inference_mode():
-                if cancel.is_set():
-                    raise GenerationCancelled
-                outputs = self.model.generate(
-                    **inputs, max_new_tokens=self.args.max_new_tokens,
-                    return_dict_in_generate=True, do_sample=False,
-                    generation_mode="interleaved", audio_temperature=0.4,
-                    audio_repetition_penalty=1.2,
-                    **streaming,
-                )
-                end = int(outputs.sequence_lengths[0])
-                text = self.processor.decode(
-                    outputs.sequences[0, prompt_length:end], skip_special_tokens=True,
-                ).replace("<think></think>", "").strip()
-                audio_length = int(outputs.audio_lengths[0])
-                if audio_length < 1:
-                    raise RuntimeError("The model returned no audio. Try increasing --max-new-tokens.")
-                if speech:
-                    speech.end()
-                    pcm = b"".join(speech.pcm)
-                else:
-                    pcm = waveform_pcm(self.codec.decode(
-                        outputs.audio_codes[:1, :, :audio_length]
-                    ).audio_values[0])
+            text, pcm = self.model.reply(inputs, self.args.max_new_tokens, emit, check)
             if not pcm:
                 raise RuntimeError("The audio decoder returned an empty waveform.")
             if cancel.is_set():
@@ -392,8 +276,6 @@ class Engine:
             raise
         except Exception as exc:
             LOG.exception("Generation failed")
-            if hasattr(self, "torch") and self.device.startswith("cuda"):
-                self.torch.cuda.empty_cache()
             raise HTTPException(500, f"Model inference failed: {exc}") from exc
         finally:
             if directory is not None:
@@ -617,6 +499,7 @@ def create_app(args, engine=None):
     @app.get("/api/status")
     def status():
         return {"ready": engine.ready, "model": args.model, "device": engine.device,
+                "precision": getattr(engine, "precision", args.precision), "backend": "onnx",
                 "max_seconds": MAX_SECONDS, "max_frames": MAX_FRAMES,
                 "preview": getattr(engine, "preview", False),
                 "turn_detector": "smart-turn-v3" if engine.turn_detector else "silence"}
@@ -650,9 +533,10 @@ def create_app(args, engine=None):
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--model", default="LiquidAI/LFM3-Omni-2B", help="Hugging Face ID or local model directory")
-    parser.add_argument("--device", default="auto", help="auto, cpu, cuda, cuda:0, or mps")
-    parser.add_argument("--dtype", choices=["auto", "float32", "float16", "bfloat16"], default="auto")
+    parser.add_argument("--model", default="LiquidAI/LFM3-Omni-2B-ONNX", help="Default Hugging Face ID or a local ONNX model folder")
+    parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
+    parser.add_argument("--precision", choices=["auto", "q4", "q4f16"], default="auto",
+                        help="auto selects q4 for CPU or q4f16 for CUDA")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--max-new-tokens", type=int, default=1024)
@@ -677,6 +561,10 @@ def parse_args(argv=None):
         parser.error("--turn-threshold must be between 0 and 1")
     if args.turn_model and args.turn_detector == "silence":
         parser.error("--turn-model cannot be combined with --turn-detector silence")
+    if args.device == "cuda" and args.precision == "q4":
+        parser.error("Use --precision q4f16 for CUDA. Plain q4 runs attention on CPU.")
+    if args.device == "cpu" and args.precision == "q4f16":
+        parser.error("Use --precision q4 for CPU.")
     return args
 
 
