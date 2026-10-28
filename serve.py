@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #   "torch", "torchvision", "torchcodec", "transformers>=5.20.2", "accelerate",
-#   "pillow", "librosa", "soundfile", "numpy", "fastapi", "uvicorn",
+#   "pillow", "librosa", "soundfile", "numpy", "fastapi", "uvicorn", "websockets",
 # ]
 # ///
 """Local camera and voice chat with LiquidAI/LFM3-Omni-2B.
@@ -12,10 +12,12 @@ Run after the model download finishes:
     uv run --python 3.12 serve.py
     uv run --python 3.12 serve.py --model /path/to/LFM3-Omni-2B
 
-Then open http://localhost:8000 and allow camera/microphone access. Speech is
-submitted after a pause, together with up to six camera frames from that turn.
-The model returns text and a 24 kHz spoken reply. This is turn-based chat;
-recording pauses during inference and playback. No separate ASR or TTS model.
+Then open http://localhost:8000 and allow camera/microphone access. A WebSocket
+streams 16 kHz PCM microphone packets and camera frames to the server. After a
+pause, the model answers with streamed text and 24 kHz PCM audio. Click Interrupt
+& speak to stop a reply, or enable voice interruption when using headphones.
+The model processes each completed utterance; incoming audio is buffered until
+the pause. No separate ASR or TTS model.
 
 Only cached model files are used by default. --download permits Hugging Face
 downloads. Custom model code is loaded with trust_remote_code=True, as required
@@ -27,10 +29,14 @@ Model API: https://huggingface.co/LiquidAI/LFM3-Omni-2B
 from __future__ import annotations
 
 import argparse
+import asyncio
 import base64
 import binascii
+import importlib
 import io
+import json
 import logging
+import struct
 import tempfile
 import threading
 import time
@@ -41,7 +47,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from starlette.concurrency import run_in_threadpool
 
@@ -60,6 +66,92 @@ SYSTEM_PROMPT = (
 )
 
 
+def pcm_wav(pcm: bytes, rate: int) -> bytes:
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(rate)
+        wav.writeframes(pcm)
+    return buffer.getvalue()
+
+
+def waveform_pcm(waveform) -> bytes:
+    import numpy as np
+
+    samples = waveform.detach().float().cpu().numpy().reshape(-1)
+    if not np.isfinite(samples).all():
+        raise RuntimeError("The audio decoder returned an invalid waveform.")
+    return (np.clip(samples, -1, 1) * 32767).astype("<i2").tobytes()
+
+
+class GenerationCancelled(Exception):
+    """Stop at the next model callback, including during speech generation."""
+
+
+class ReplyStream:
+    """Decode incremental codec frames while keeping its overlap and KV cache."""
+
+    def __init__(self, engine, emit, cancel):
+        self.engine, self.emit, self.cancel = engine, emit, cancel
+        self.cache = engine.codec_cache_class(engine.codec.config)
+        self.pending, self.pcm = [], []
+        self.last_frame = None
+        self.finished = False
+
+    def check(self):
+        if self.cancel.is_set():
+            raise GenerationCancelled
+
+    def put(self, codes):
+        self.check()
+        self.last_frame = codes
+        self.pending.append(codes)
+        if len(self.pending) >= 4:  # Four codec frames represent 320 ms of speech.
+            self.flush(finalize=False)
+
+    def flush(self, finalize):
+        self.check()
+        if self.last_frame is None:
+            return
+        codes = (self.engine.torch.stack(self.pending, dim=-1).unsqueeze(0) if self.pending
+                 else self.last_frame.new_empty((1, self.last_frame.numel(), 0)))
+        self.pending.clear()
+        with self.engine.torch.inference_mode():
+            output = self.engine.codec.decode(codes, streaming_cache=self.cache, finalize=finalize)
+        pcm = waveform_pcm(output.audio_values[0])
+        if pcm:
+            self.pcm.append(pcm)
+            self.emit({"type": "audio", "pcm": pcm})
+
+    def end(self):
+        if not self.finished:
+            self.finished = True
+            self.flush(finalize=True)
+
+
+class TextStream:
+    def __init__(self, processor, emit, cancel):
+        self.processor, self.emit, self.cancel = processor, emit, cancel
+        self.prompt = True
+        self.tokens, self.text = [], ""
+
+    def put(self, tokens):
+        if self.cancel.is_set():
+            raise GenerationCancelled
+        if self.prompt:
+            self.prompt = False
+            return
+        self.tokens.extend(tokens.reshape(-1).tolist())
+        text = self.processor.decode(self.tokens, skip_special_tokens=True).replace("<think></think>", "").strip()
+        if text != self.text and not text.endswith("\ufffd"):
+            self.text = text
+            self.emit({"type": "text", "text": text})
+
+    def end(self):
+        pass
+
+
 def decode_base64(value: object, limit: int) -> bytes:
     if not isinstance(value, str) or len(value) > (limit + 2) // 3 * 4:
         raise ValueError("Missing or oversized media data.")
@@ -72,6 +164,11 @@ def decode_base64(value: object, limit: int) -> bytes:
     return data
 
 
+def valid_session_id(value):
+    return (isinstance(value, str) and 1 <= len(value) <= 64
+            and all(c in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for c in value))
+
+
 def validate_turn(payload: object) -> tuple[str, bytes, list[tuple[float, bytes]]]:
     """Validate browser media before it reaches the model or session storage."""
     from PIL import Image, UnidentifiedImageError
@@ -79,8 +176,7 @@ def validate_turn(payload: object) -> tuple[str, bytes, list[tuple[float, bytes]
     if not isinstance(payload, dict):
         raise TypeError("Expected a JSON object.")
     session_id = payload.get("session_id")
-    if (not isinstance(session_id, str) or not 1 <= len(session_id) <= 64
-            or not all(c in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for c in session_id)):
+    if not valid_session_id(session_id):
         raise ValueError("Invalid session ID.")
     audio = decode_base64(payload.get("audio"), INPUT_RATE * 2 * MAX_SECONDS + 4096)
     try:
@@ -168,6 +264,7 @@ class Engine:
         self.processor = AutoProcessor.from_pretrained(self.args.model, **kwargs)
         # The codec stays in its own float32 dtype, as in Liquid AI's example.
         self.codec = self.processor.audio_tokenizer.to(device=device).eval()
+        self.codec_cache_class = importlib.import_module(type(self.codec).__module__).LiquidCodecStreamingCache
         self.context_length = getattr(self.model.config, "max_position_embeddings", 32768)
         self.ready = True
         LOG.info("Model ready")
@@ -199,13 +296,16 @@ class Engine:
         finally:
             self.lock.release()
 
-    def respond(self, session_id: str, audio: bytes, frames: list) -> dict:
+    def respond(self, session_id: str, audio: bytes, frames: list, emit=None, cancel=None) -> dict:
         if not self.ready:
             raise HTTPException(503, "UI-only mode. Restart without --ui-only to load the model.")
         if not self.lock.acquire(blocking=False):
             raise HTTPException(409, "The model is answering another turn. Please try again shortly.")
         directory = None
+        cancel = cancel or threading.Event()
         try:
+            if cancel.is_set():
+                raise GenerationCancelled
             started = time.monotonic()
             session = self.get_session(session_id)
             directory = tempfile.TemporaryDirectory(prefix="lfm3-turn-")
@@ -241,12 +341,18 @@ class Engine:
                     raise HTTPException(413, "This turn exceeds the model context. Try a shorter recording.")
                 session.turns.pop(0).directory.cleanup()
             inputs = inputs.to(self.device)
+            speech = ReplyStream(self, emit, cancel) if emit else None
+            streaming = ({"audio_streamer": speech, "streamer": TextStream(self.processor, emit, cancel)}
+                         if emit else {})
             with self.torch.inference_mode():
+                if cancel.is_set():
+                    raise GenerationCancelled
                 outputs = self.model.generate(
                     **inputs, max_new_tokens=self.args.max_new_tokens,
                     return_dict_in_generate=True, do_sample=False,
                     generation_mode="interleaved", audio_temperature=0.4,
                     audio_repetition_penalty=1.2,
+                    **streaming,
                 )
                 end = int(outputs.sequence_lengths[0])
                 text = self.processor.decode(
@@ -255,31 +361,27 @@ class Engine:
                 audio_length = int(outputs.audio_lengths[0])
                 if audio_length < 1:
                     raise RuntimeError("The model returned no audio. Try increasing --max-new-tokens.")
-                waveform = self.codec.decode(
-                    outputs.audio_codes[:1, :, :audio_length]
-                ).audio_values[0]
-            import numpy as np
-
-            samples = waveform.detach().float().cpu().numpy().reshape(-1)
-            if samples.size == 0 or not np.isfinite(samples).all():
-                raise RuntimeError("The audio decoder returned an invalid waveform.")
-            pcm = (np.clip(samples, -1, 1) * 32767).astype("<i2").tobytes()
-            buffer = io.BytesIO()
-            with wave.open(buffer, "wb") as wav:
-                wav.setnchannels(1)
-                wav.setsampwidth(2)
-                wav.setframerate(OUTPUT_RATE)
-                wav.writeframes(pcm)
+                if speech:
+                    speech.end()
+                    pcm = b"".join(speech.pcm)
+                else:
+                    pcm = waveform_pcm(self.codec.decode(
+                        outputs.audio_codes[:1, :, :audio_length]
+                    ).audio_values[0])
+            if not pcm:
+                raise RuntimeError("The audio decoder returned an empty waveform.")
+            if cancel.is_set():
+                raise GenerationCancelled
             session.turns.append(Turn(directory, user, {"role": "assistant", "content": text}))
             directory = None  # The session owns the files until this turn expires.
             while len(session.turns) > self.args.history_turns:
                 session.turns.pop(0).directory.cleanup()
             return {
-                "text": text, "audio": base64.b64encode(buffer.getvalue()).decode("ascii"),
+                "text": text, "audio": base64.b64encode(pcm_wav(pcm, OUTPUT_RATE)).decode("ascii"),
                 "sample_rate": OUTPUT_RATE, "seconds": round(time.monotonic() - started, 2),
                 "frames": len(frames),
             }
-        except HTTPException:
+        except (HTTPException, GenerationCancelled):
             raise
         except Exception as exc:
             LOG.exception("Generation failed")
@@ -290,6 +392,157 @@ class Engine:
             if directory is not None:
                 directory.cleanup()
             self.lock.release()
+
+
+async def serve_live(websocket: WebSocket, engine: Engine):
+    """Binary input is PCM16LE/16kHz. Binary output is uint32 turn ID + PCM16LE/24kHz.
+
+    JSON start/frame/commit/cancel/reset messages delimit turns. Each reply JSON
+    event carries the same turn ID, allowing the browser to discard stale output.
+    Only the sender task writes to the socket after the initial ready message.
+    """
+    origin = websocket.headers.get("origin")
+    if origin:
+        from urllib.parse import urlsplit
+
+        if urlsplit(origin).netloc != websocket.headers.get("host"):
+            await websocket.close(code=1008)
+            return
+    await websocket.accept()
+    await websocket.send_json({"type": "ready", "ready": engine.ready,
+                               "input_rate": INPUT_RATE, "output_rate": OUTPUT_RATE})
+    if not engine.ready:
+        await websocket.close(code=1000)
+        return
+    queue = asyncio.Queue(maxsize=32)
+    loop = asyncio.get_running_loop()
+    worker, cancelled, recording, turn_id = None, threading.Event(), None, 0
+
+    async def sender():
+        while True:
+            event = await queue.get()
+            if event["type"] == "audio":
+                await websocket.send_bytes(struct.pack("<I", event["id"]) + event["pcm"])
+            else:
+                await websocket.send_json(event)
+
+    async def generate(session_id, audio, frames, reply_id, cancellation):
+        async def terminal(event):
+            while not cancellation.is_set():
+                try:
+                    await asyncio.wait_for(queue.put(event), timeout=0.1)
+                    return
+                except TimeoutError:
+                    continue
+
+        def emit(event):
+            if cancellation.is_set():
+                raise GenerationCancelled
+            pending = asyncio.run_coroutine_threadsafe(queue.put({**event, "id": reply_id}), loop)
+            try:
+                while True:
+                    try:
+                        pending.result(timeout=0.1)
+                        return
+                    except TimeoutError:
+                        if cancellation.is_set():
+                            raise GenerationCancelled
+            finally:
+                if not pending.done():
+                    pending.cancel()
+
+        try:
+            result = await run_in_threadpool(engine.respond, session_id, audio, frames, emit, cancellation)
+            if not cancellation.is_set():
+                result.pop("audio", None)  # PCM has already been streamed.
+                await terminal({"type": "done", "id": reply_id, **result})
+        except GenerationCancelled:
+            pass
+        except HTTPException as exc:
+            if not cancellation.is_set():
+                await terminal({"type": "error", "id": reply_id, "detail": exc.detail})
+
+    async def stop_generation():
+        cancelled.set()
+        if worker:
+            await worker
+
+    writer = asyncio.create_task(sender())
+    try:
+        while True:
+            packet = await websocket.receive()
+            if packet["type"] == "websocket.disconnect":
+                break
+            try:
+                pcm = packet.get("bytes")
+                if pcm is not None:
+                    if recording is None:
+                        continue
+                    if len(pcm) > 16384 or len(pcm) % 2:
+                        raise ValueError("Send PCM16 audio in packets of at most 16 KiB.")
+                    recording["pcm"].extend(pcm)
+                    if len(recording["pcm"]) > INPUT_RATE * 2 * MAX_SECONDS:
+                        raise ValueError(f"Record at most {MAX_SECONDS} seconds per turn.")
+                    continue
+                raw = packet.get("text", "")
+                if len(raw) > 410_000:
+                    raise ValueError("Control message is too large.")
+                event = json.loads(raw)
+                if not isinstance(event, dict):
+                    raise TypeError("Expected a control message.")
+                kind = event.get("type")
+                if kind in ("start", "reset"):
+                    new_id = event.get("id")
+                    if (isinstance(new_id, bool) or not isinstance(new_id, int)
+                            or not turn_id < new_id <= 0xFFFFFFFF or not valid_session_id(event.get("session_id"))):
+                        raise ValueError("Invalid turn or session ID.")
+                    turn_id = new_id
+                    cancelled.set()
+                    recording = None
+                    if kind == "reset":
+                        await stop_generation()
+                        await run_in_threadpool(engine.reset, event["session_id"])
+                        await queue.put({"type": "reset", "id": turn_id})
+                    else:
+                        recording = {"session_id": event["session_id"], "pcm": bytearray(), "frames": [], "size": 0}
+                elif kind == "cancel":
+                    cancelled.set()
+                    recording = None
+                elif kind == "frame":
+                    if recording is None:
+                        continue
+                    recording["size"] += len(raw)
+                    if recording["size"] > MAX_BODY or len(recording["frames"]) >= 64:
+                        raise ValueError("Too many camera frames.")
+                    recording["frames"].append({"time": event.get("time"), "image": event.get("image")})
+                elif kind == "commit":
+                    if recording is None:
+                        raise ValueError("Start a recording before committing it.")
+                    data, recording = recording, None
+                    frames = data["frames"] if event.get("use_camera", True) else []
+                    if len(frames) > MAX_FRAMES:
+                        frames = [frames[round(i * (len(frames) - 1) / (MAX_FRAMES - 1))] for i in range(MAX_FRAMES)]
+                    payload = {"session_id": data["session_id"], "audio": base64.b64encode(
+                        pcm_wav(bytes(data["pcm"]), INPUT_RATE)).decode("ascii"), "frames": frames}
+                    validated = await run_in_threadpool(validate_turn, payload)
+                    await stop_generation()
+                    cancelled = threading.Event()
+                    await queue.put({"type": "generating", "id": turn_id})
+                    worker = asyncio.create_task(generate(*validated, turn_id, cancelled))
+                else:
+                    raise ValueError("Unknown control message.")
+            except (ValueError, TypeError, HTTPException) as exc:
+                recording = None
+                detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
+                await queue.put({"type": "error", "id": turn_id, "detail": detail})
+    except (WebSocketDisconnect, RuntimeError):
+        pass
+    finally:
+        cancelled.set()
+        writer.cancel()
+        await asyncio.gather(writer, return_exceptions=True)
+        if worker:
+            await worker
 
 
 def create_app(args, engine=None):
@@ -319,6 +572,10 @@ def create_app(args, engine=None):
         return {"ready": engine.ready, "model": args.model, "device": engine.device,
                 "max_seconds": MAX_SECONDS, "max_frames": MAX_FRAMES}
 
+    @app.websocket("/api/live")
+    async def live(websocket: WebSocket):
+        await serve_live(websocket, engine)
+
     @app.post("/api/turn")
     async def turn(request: Request):
         # Read with a cap even when Content-Length is absent.
@@ -327,8 +584,6 @@ def create_app(args, engine=None):
             body.extend(chunk)
             if len(body) > MAX_BODY:
                 raise HTTPException(413, "Recording is too large.")
-        import json
-
         try:
             payload = json.loads(body)
             validated = await run_in_threadpool(validate_turn, payload)

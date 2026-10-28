@@ -31,15 +31,15 @@ audio { max-width: 100%; margin-top: 14px } #play { display: none } .hint { font
     <div id="status" role="status" aria-live="polite">Checking model...</div>
     <meter id="level" min="0" max="0.12" value="0" aria-label="Microphone level"></meter>
     <label><input id="automatic" type="checkbox" checked> Send automatically after a pause</label>
+    <label><input id="bargeIn" type="checkbox"> Allow voice interruption, use headphones</label>
     <label><input id="useCamera" type="checkbox" checked> Include camera frames</label>
     <label class="hint">Mic threshold <input id="threshold" type="range" min="0.005" max="0.08" step="0.001" value="0.018"></label>
-    <p class="hint">Speak naturally, then pause for about a second. You can also use Speak / Send. Each turn includes up to six camera frames. The mic pauses while the model answers.</p>
+    <p class="hint">Speak, then pause for a reply. Audio streams as the model generates it. Click Interrupt &amp; speak to stop the reply and ask another question. Each turn includes up to six camera frames.</p>
     <p class="hint">Video preview is mirrored. The model sees the original camera image.</p>
   </section>
   <section class="panel" aria-label="Conversation">
     <div id="messages" role="log" aria-live="polite"><p class="muted" id="empty">Your spoken replies will appear here.</p></div>
     <audio id="reply" controls></audio>
-    <button id="play">Play reply</button>
     <div class="buttons"><button id="clear" class="secondary">New conversation</button></div>
     <p class="hint" id="modelInfo"></p>
   </section>
@@ -48,11 +48,13 @@ audio { max-width: 100%; margin-top: 14px } #play { display: none } .hint { font
 'use strict';
 const $ = id => document.getElementById(id);
 let sessionId = crypto.randomUUID();
-let stream, context, source, worklet, mute, timer, audioUrl;
-let connected = false, busy = false, recording = false, manual = false;
-let chunks = [], preRoll = [], frames = [], recordedSamples = 0;
-let captureRate = 48000, lastVoice = 0, epoch = 0, resumeAt = 0, modelReady = false;
-let maxSeconds = 30, maxFrames = 6;
+let stream, context, source, worklet, mute, timer, socket, audioUrl;
+let connected = false, busy = false, recording = false, manual = false, resetting = false;
+let preRoll = [], recordedSamples = 0, frameCount = 0, voiceRun = 0;
+let lastVoice = 0, resumeAt = 0, modelReady = false, maxSeconds = 30;
+let nextTurn = 0, activeTurn = 0, replyBody, replyMeta, replyChunks = [];
+let playbackAt = 0;
+const playing = new Set();
 
 function status(text, error = false) {
   $('status').textContent = text;
@@ -61,27 +63,53 @@ function status(text, error = false) {
 function message(text, who, meta = '') {
   $('empty')?.remove();
   const box = document.createElement('div'); box.className = 'message ' + who;
-  if (meta) { const label = document.createElement('div'); label.className = 'meta'; label.textContent = meta; box.append(label); }
+  const label = document.createElement('div'); label.className = 'meta'; label.textContent = meta;
+  if (meta) box.append(label);
   const body = document.createElement('div'); body.textContent = text; box.append(body);
   $('messages').append(box); $('messages').scrollTop = $('messages').scrollHeight;
+  return {body, label};
 }
 function controls() {
-  $('start').disabled = connected || busy || !modelReady;
+  $('start').disabled = connected || !modelReady;
   $('stop').disabled = !connected;
-  $('talk').disabled = !connected || busy || !$('reply').paused;
-  $('clear').disabled = busy;
-  $('talk').textContent = recording ? 'Send' : 'Speak';
+  $('talk').disabled = !connected || resetting;
+  $('talk').textContent = recording ? 'Send' : busy || playing.size || !$('reply').paused ? 'Interrupt & speak' : 'Speak';
   $('talk').classList.toggle('active', recording);
+  $('clear').disabled = resetting;
 }
 function listening() {
-  if (connected && !busy && $('reply').paused) {
+  if (connected && !busy && !recording && !playing.size && $('reply').paused) {
     status($('automatic').checked ? 'Listening...' : 'Ready. Click Speak to record.');
   }
   controls();
 }
+function send(event) {
+  if (!socket || socket.readyState !== WebSocket.OPEN) throw new Error('Connection closed. Restart the camera and microphone.');
+  if (socket.bufferedAmount > 1_000_000) throw new Error('Connection is too slow. Restart and try a shorter recording.');
+  socket.send(event instanceof ArrayBuffer ? event : JSON.stringify(event));
+}
 function clearRecording() {
-  recording = false; manual = false; chunks = []; frames = []; recordedSamples = 0; preRoll = [];
+  recording = false; manual = false; preRoll = []; recordedSamples = 0; frameCount = 0; voiceRun = 0;
   controls();
+}
+function stopPlayback() {
+  for (const node of playing) { node.onended = null; node.stop(); node.disconnect(); }
+  playing.clear(); playbackAt = 0; $('reply').pause();
+}
+function clearReplay() {
+  $('reply').removeAttribute('src'); $('reply').load();
+  if (audioUrl) URL.revokeObjectURL(audioUrl);
+  audioUrl = null; replyChunks = [];
+}
+function cancelReply() {
+  if (socket?.readyState === WebSocket.OPEN) send({type: 'cancel'});
+  if (busy && replyMeta) replyMeta.textContent = 'LFM3 · interrupted';
+  stopPlayback(); busy = false; resumeAt = 0;
+}
+function sendSamples(samples) {
+  const buffer = new ArrayBuffer(samples.length * 2), view = new DataView(buffer);
+  for (let i = 0; i < samples.length; i++) view.setInt16(i * 2, Math.max(-1, Math.min(1, samples[i])) * 32767, true);
+  send(buffer); recordedSamples += samples.length;
 }
 function captureFrame() {
   const video = $('camera');
@@ -90,93 +118,137 @@ function captureFrame() {
   const scale = Math.min(1, 384 / Math.max(video.videoWidth, video.videoHeight));
   canvas.width = Math.round(video.videoWidth * scale); canvas.height = Math.round(video.videoHeight * scale);
   canvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height);
-  frames.push({time: recordedSamples / captureRate, image: canvas.toDataURL('image/jpeg', 0.75).split(',')[1]});
+  send({type: 'frame', time: recordedSamples / 16000, image: canvas.toDataURL('image/jpeg', 0.75).split(',')[1]});
+  frameCount++;
 }
 function beginTurn(isManual) {
-  if (!connected || busy || recording || !$('reply').paused || performance.now() < resumeAt) return;
-  recording = true; manual = isManual; chunks = preRoll.slice(); preRoll = [];
-  recordedSamples = chunks.reduce((n, c) => n + c.length, 0); frames = [];
-  lastVoice = performance.now(); captureFrame(); status('Recording...'); controls();
+  if (!connected || recording || resetting) return;
+  cancelReply();
+  activeTurn = ++nextTurn;
+  send({type: 'start', id: activeTurn, session_id: sessionId});
+  clearReplay(); replyBody = replyMeta = null;
+  recording = true; manual = isManual; recordedSamples = 0; frameCount = 0;
+  const prior = preRoll; preRoll = [];
+  for (const samples of prior) sendSamples(samples);
+  lastVoice = performance.now(); voiceRun = 0;
+  captureFrame(); status('Recording...'); controls();
 }
 function onSamples(samples) {
   let sum = 0; for (const x of samples) sum += x * x;
   const rms = Math.sqrt(sum / samples.length); $('level').value = rms;
-  if (!connected || busy || !$('reply').paused || performance.now() < resumeAt) { preRoll = []; return; }
+  if (!connected || resetting) return;
   const now = performance.now(), voiced = rms >= Number($('threshold').value);
   if (!recording) {
-    if ($('automatic').checked && voiced) beginTurn(false);
+    const answering = busy || playing.size || !$('reply').paused;
+    if (answering && !$('bargeIn').checked) { preRoll = []; return; }
+    if (!answering && now < resumeAt) { preRoll = []; return; }
+    voiceRun = voiced ? voiceRun + samples.length / 16 : 0;
+    if ($('automatic').checked && voiced && (!answering || voiceRun >= 200)) beginTurn(false);
     else {
       preRoll.push(samples);
-      while (preRoll.length > Math.ceil(captureRate * 0.25 / samples.length)) preRoll.shift();
+      while (preRoll.length > 4) preRoll.shift();
       return;
     }
   }
-  chunks.push(samples); recordedSamples += samples.length;
-  if (voiced) lastVoice = now;
-  if (recordedSamples >= captureRate * (maxSeconds - 0.1) ||
-      (!manual && now - lastVoice >= 1000 && recordedSamples > captureRate * 0.5)) {
-    void sendTurn();
-  }
-}
-function selectFrames(all) {
-  if (all.length <= maxFrames) return all;
-  return Array.from({length: maxFrames}, (_, i) => all[Math.round(i * (all.length - 1) / (maxFrames - 1))]);
-}
-function bytesBase64(bytes) {
-  let text = '';
-  for (let i = 0; i < bytes.length; i += 16384) text += String.fromCharCode(...bytes.subarray(i, i + 16384));
-  return btoa(text);
-}
-async function encodeWav(parts, rate) {
-  const size = parts.reduce((n, c) => n + c.length, 0);
-  const offline = new OfflineAudioContext(1, Math.ceil(size * 16000 / rate), 16000);
-  const buffer = offline.createBuffer(1, size, rate), data = buffer.getChannelData(0);
-  let at = 0; for (const part of parts) { data.set(part, at); at += part.length; }
-  const node = offline.createBufferSource(); node.buffer = buffer; node.connect(offline.destination); node.start();
-  const pcm = (await offline.startRendering()).getChannelData(0);
-  const wav = new ArrayBuffer(44 + pcm.length * 2), view = new DataView(wav);
-  const word = (offset, value) => { for (let i = 0; i < value.length; i++) view.setUint8(offset + i, value.charCodeAt(i)); };
-  word(0, 'RIFF'); view.setUint32(4, 36 + pcm.length * 2, true); word(8, 'WAVE'); word(12, 'fmt ');
-  view.setUint32(16, 16, true); view.setUint16(20, 1, true); view.setUint16(22, 1, true);
-  view.setUint32(24, 16000, true); view.setUint32(28, 32000, true); view.setUint16(32, 2, true); view.setUint16(34, 16, true);
-  word(36, 'data'); view.setUint32(40, pcm.length * 2, true);
-  for (let i = 0; i < pcm.length; i++) view.setInt16(44 + i * 2, Math.max(-1, Math.min(1, pcm[i])) * 32767, true);
-  return bytesBase64(new Uint8Array(wav));
-}
-async function sendTurn() {
-  if (!recording || busy) return;
-  if (recordedSamples < captureRate * 0.1) { clearRecording(); listening(); return; }
-  captureFrame();
-  const parts = chunks, selected = $('useCamera').checked ? selectFrames(frames) : [];
-  const duration = recordedSamples / captureRate, thisEpoch = epoch;
-  busy = true; clearRecording(); status('Model is thinking...'); controls();
-  message(`Spoken message · ${duration.toFixed(1)}s · ${selected.length} camera frames`, 'user');
   try {
-    const audio = await encodeWav(parts, captureRate);
-    if (epoch !== thisEpoch) return;
-    const response = await fetch('/api/turn', {method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({session_id: sessionId, audio, frames: selected})});
-    const result = await response.json();
-    if (!response.ok) throw new Error(result.detail || 'The request failed.');
-    if (epoch !== thisEpoch) return;
-    message(result.text || '[Audio reply]', 'assistant', `LFM3 · ${result.seconds}s`);
-    if (audioUrl) URL.revokeObjectURL(audioUrl);
-    const raw = atob(result.audio), bytes = Uint8Array.from(raw, c => c.charCodeAt(0));
-    audioUrl = URL.createObjectURL(new Blob([bytes], {type: 'audio/wav'}));
-    $('reply').src = audioUrl;
-    try { await $('reply').play(); status('Speaking...'); }
-    catch { status('Click Play reply to hear the answer.'); $('play').style.display = 'inline-block'; }
-  } catch (error) {
-    if (epoch === thisEpoch) { status(error.message, true); message(error.message, 'error'); }
-  } finally {
-    busy = false; resumeAt = performance.now() + 500; controls();
-    // Preserve errors and autoplay instructions until the next interaction.
+    sendSamples(samples);
+    if (voiced) lastVoice = now;
+    if (recordedSamples >= 16000 * (maxSeconds - 0.1) ||
+        (!manual && now - lastVoice >= 900 && recordedSamples > 8000)) commitTurn();
+  } catch (error) { failConnection(error); }
+}
+function commitTurn() {
+  if (!recording) return;
+  if (recordedSamples < 1600) { send({type: 'cancel'}); clearRecording(); listening(); return; }
+  captureFrame();
+  const duration = recordedSamples / 16000, count = $('useCamera').checked ? Math.min(6, frameCount) : 0;
+  send({type: 'commit', use_camera: $('useCamera').checked});
+  busy = true; clearRecording(); status('Model is thinking...'); controls();
+  message(`Spoken message · ${duration.toFixed(1)}s · ${count} camera frames`, 'user');
+}
+function ensureReply() {
+  if (!replyBody) {
+    const {body, label} = message('', 'assistant', 'LFM3 · streaming');
+    replyBody = body; replyMeta = label;
   }
 }
-
+function playChunk(packet) {
+  if (packet.byteLength < 6 || (packet.byteLength - 4) % 2) throw new Error('Invalid streamed audio packet.');
+  const view = new DataView(packet);
+  if (view.getUint32(0, true) !== activeTurn || !connected) return;
+  ensureReply();
+  const pcm = new Uint8Array(packet.slice(4)); replyChunks.push(pcm);
+  const buffer = context.createBuffer(1, pcm.length / 2, 24000), data = buffer.getChannelData(0);
+  for (let i = 0; i < data.length; i++) data[i] = view.getInt16(4 + i * 2, true) / 32768;
+  const node = context.createBufferSource(); node.buffer = buffer; node.connect(context.destination);
+  playbackAt = Math.max(playbackAt, context.currentTime + 0.04);
+  playing.add(node); node.start(playbackAt); playbackAt += buffer.duration;
+  node.onended = () => {
+    playing.delete(node); node.disconnect();
+    if (!playing.size) { resumeAt = performance.now() + 350; listening(); }
+  };
+  status('Speaking...'); controls();
+}
+function saveReplay() {
+  const length = replyChunks.reduce((n, part) => n + part.length, 0);
+  if (!length) return;
+  const header = new ArrayBuffer(44), view = new DataView(header);
+  const word = (offset, text) => { for (let i = 0; i < text.length; i++) view.setUint8(offset + i, text.charCodeAt(i)); };
+  word(0, 'RIFF'); view.setUint32(4, 36 + length, true); word(8, 'WAVE'); word(12, 'fmt ');
+  view.setUint32(16, 16, true); view.setUint16(20, 1, true); view.setUint16(22, 1, true);
+  view.setUint32(24, 24000, true); view.setUint32(28, 48000, true); view.setUint16(32, 2, true); view.setUint16(34, 16, true);
+  word(36, 'data'); view.setUint32(40, length, true);
+  if (audioUrl) URL.revokeObjectURL(audioUrl);
+  audioUrl = URL.createObjectURL(new Blob([header, ...replyChunks], {type: 'audio/wav'}));
+  $('reply').src = audioUrl;
+}
+async function connectSocket() {
+  const target = new WebSocket(`${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/api/live`);
+  target.binaryType = 'arraybuffer'; socket = target; activeTurn = nextTurn = 0;
+  await new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => { reject(new Error('WebSocket connection timed out.')); target.close(); }, 15000);
+    target.onmessage = event => {
+      if (socket !== target) return;
+      try {
+        if (event.data instanceof ArrayBuffer) { playChunk(event.data); return; }
+        const data = JSON.parse(event.data);
+        if (data.type === 'ready') {
+          clearTimeout(timeout);
+          if (!data.ready) reject(new Error('Model is not loaded. Restart without --ui-only.'));
+          else if (data.input_rate !== 16000 || data.output_rate !== 24000) reject(new Error('Unsupported audio sample rate.'));
+          else resolve();
+          return;
+        }
+        if (data.id !== activeTurn) return;
+        if (data.type === 'text') { ensureReply(); replyBody.textContent = data.text; }
+        if (data.type === 'generating') status('Model is thinking...');
+        if (data.type === 'done') {
+          busy = false; ensureReply(); replyBody.textContent = data.text || '[Audio reply]';
+          replyMeta.textContent = `LFM3 · ${data.seconds}s`; saveReplay(); listening();
+        }
+        if (data.type === 'reset') {
+          resetting = false; busy = false; sessionId = crypto.randomUUID();
+          $('messages').replaceChildren(); replyBody = replyMeta = null; clearReplay(); listening();
+        }
+        if (data.type === 'error') {
+          busy = resetting = false; clearRecording(); stopPlayback();
+          status(data.detail || 'The model request failed.', true); message(data.detail, 'error'); controls();
+        }
+      } catch (error) { reject(error); failConnection(error); }
+    };
+    target.onerror = () => { clearTimeout(timeout); reject(new Error('WebSocket connection failed.')); };
+    target.onclose = () => {
+      clearTimeout(timeout); reject(new Error('WebSocket connection closed.'));
+      if (socket === target) { socket = null; failConnection(new Error('Connection closed. Start again to reconnect.')); }
+    };
+  });
+}
+function failConnection(error) {
+  void stopMedia().then(() => status(error.message, true));
+}
 const workletCode = `
 class MicCapture extends AudioWorkletProcessor {
-  constructor() { super(); this.buffer = new Float32Array(2048); this.at = 0; }
+  constructor() { super(); this.buffer = new Float32Array(1024); this.at = 0; }
   process(inputs) {
     const channels = inputs[0];
     if (channels && channels.length) {
@@ -185,7 +257,7 @@ class MicCapture extends AudioWorkletProcessor {
         this.buffer[this.at++] = value / channels.length;
         if (this.at === this.buffer.length) {
           this.port.postMessage(this.buffer, [this.buffer.buffer]);
-          this.buffer = new Float32Array(2048); this.at = 0;
+          this.buffer = new Float32Array(1024); this.at = 0;
         }
       }
     }
@@ -195,78 +267,79 @@ class MicCapture extends AudioWorkletProcessor {
 registerProcessor('mic-capture', MicCapture);`;
 
 $('start').onclick = async () => {
-  if (!window.isSecureContext || !navigator.mediaDevices) {
-    status('Camera and mic require localhost or HTTPS.', true); return;
-  }
-  $('start').disabled = true; status('Requesting camera and microphone...');
+  if (!window.isSecureContext || !navigator.mediaDevices) { status('Camera and mic require localhost or HTTPS.', true); return; }
+  $('start').disabled = true; status('Connecting camera and microphone...');
   try {
-    // Resume audio inside the click handler before waiting for permissions.
-    context = new AudioContext(); await context.resume();
+    context = new AudioContext({sampleRate: 16000}); await context.resume();
+    if (context.sampleRate !== 16000) throw new Error('This browser does not support a 16 kHz AudioContext.');
+    await connectSocket();
     stream = await navigator.mediaDevices.getUserMedia({
       video: $('useCamera').checked ? {width: {ideal: 640}, height: {ideal: 480}} : false,
       audio: {channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true}
     });
     $('camera').srcObject = stream;
-    captureRate = context.sampleRate;
     const moduleUrl = URL.createObjectURL(new Blob([workletCode], {type: 'text/javascript'}));
     try { await context.audioWorklet.addModule(moduleUrl); } finally { URL.revokeObjectURL(moduleUrl); }
-    source = context.createMediaStreamSource(stream);
-    worklet = new AudioWorkletNode(context, 'mic-capture');
-    worklet.port.onmessage = event => onSamples(event.data);
+    source = context.createMediaStreamSource(stream); worklet = new AudioWorkletNode(context, 'mic-capture');
+    worklet.port.onmessage = event => {
+      try { onSamples(event.data); } catch (error) { failConnection(error); }
+    };
     mute = context.createGain(); mute.gain.value = 0;
     source.connect(worklet); worklet.connect(mute); mute.connect(context.destination);
-    connected = true; epoch++; timer = setInterval(captureFrame, 500);
-    for (const track of stream.getTracks()) track.onended = () => { void stopMedia(); status('Camera or microphone disconnected.', true); };
+    connected = true;
+    timer = setInterval(() => { try { captureFrame(); } catch (error) { failConnection(error); } }, 500);
+    for (const track of stream.getTracks()) track.onended = () => failConnection(new Error('Camera or microphone disconnected.'));
     listening();
-  } catch (error) {
-    await stopMedia(); status('Could not start camera/mic: ' + error.message, true);
-  }
+  } catch (error) { await stopMedia(); status('Could not start: ' + error.message, true); }
 };
 async function stopMedia() {
-  connected = false; epoch++; clearInterval(timer);
+  connected = false; clearInterval(timer);
+  const target = socket; socket = null; target?.close();
   if (worklet) { worklet.port.onmessage = null; worklet.disconnect(); }
   source?.disconnect(); mute?.disconnect();
   for (const track of stream?.getTracks() || []) { track.onended = null; track.stop(); }
-  stream = null; $('camera').srcObject = null;
-  if (context && context.state !== 'closed') await context.close();
-  context = null; source = null; worklet = null; mute = null;
-  $('reply').pause(); $('play').style.display = 'none';
+  stream = null; $('camera').srcObject = null; stopPlayback();
+  const previous = context; context = null;
+  if (previous && previous.state !== 'closed') await previous.close();
+  source = worklet = mute = null; busy = resetting = false;
   clearRecording(); $('level').value = 0; controls();
 }
 $('stop').onclick = async () => { await stopMedia(); status('Stopped.'); };
-$('talk').onclick = () => { if (recording) void sendTurn(); else beginTurn(true); };
+$('talk').onclick = () => {
+  try { if (recording) commitTurn(); else beginTurn(true); }
+  catch (error) { failConnection(error); }
+};
 $('automatic').onchange = () => { if (!recording) listening(); };
 $('useCamera').onchange = () => {
-  if (!$('useCamera').checked) frames = [];
   if (connected && $('useCamera').checked && !stream.getVideoTracks().length) status('Stop and restart to enable the camera.');
 };
-$('reply').onplay = () => { preRoll = []; clearRecording(); status('Speaking...'); controls(); };
-$('reply').onpause = $('reply').onended = () => {
-  $('play').style.display = 'none'; preRoll = []; resumeAt = performance.now() + 500; listening();
+$('reply').onplay = () => {
+  for (const node of playing) { node.onended = null; node.stop(); node.disconnect(); }
+  playing.clear(); playbackAt = 0; preRoll = [];
+  if (recording) { send({type: 'cancel'}); clearRecording(); }
+  status('Playing reply...'); controls();
 };
-$('play').onclick = async () => {
-  try { await $('reply').play(); $('play').style.display = 'none'; }
-  catch (error) { status('Audio playback failed: ' + error.message, true); }
-};
+$('reply').onpause = $('reply').onended = () => { preRoll = []; resumeAt = performance.now() + 350; listening(); };
 $('clear').onclick = async () => {
-  if (busy) return;
-  busy = true; clearRecording(); $('reply').pause(); controls();
+  if (resetting) return;
   try {
-    const response = await fetch('/api/session/' + sessionId, {method: 'DELETE'});
-    if (!response.ok) throw new Error((await response.json()).detail);
-    sessionId = crypto.randomUUID(); epoch++;
-    $('messages').replaceChildren(); $('reply').removeAttribute('src'); $('reply').load();
-    if (audioUrl) URL.revokeObjectURL(audioUrl); audioUrl = null;
-    status(connected ? ($('automatic').checked ? 'Listening...' : 'Ready. Click Speak to record.') : 'Conversation cleared.');
-  } catch (error) { status(error.message, true); }
-  finally { busy = false; resumeAt = performance.now() + 500; controls(); }
+    cancelReply(); clearRecording();
+    if (connected) {
+      activeTurn = ++nextTurn; resetting = true; controls(); status('Clearing conversation...');
+      send({type: 'reset', id: activeTurn, session_id: sessionId});
+    } else {
+      const response = await fetch('/api/session/' + sessionId, {method: 'DELETE'});
+      if (!response.ok) throw new Error((await response.json()).detail);
+      sessionId = crypto.randomUUID(); $('messages').replaceChildren(); clearReplay(); status('Conversation cleared.');
+    }
+  } catch (error) { resetting = false; status(error.message, true); controls(); }
 };
 window.addEventListener('pagehide', () => {
-  for (const track of stream?.getTracks() || []) track.stop();
+  socket?.close(); for (const track of stream?.getTracks() || []) track.stop();
   if (audioUrl) URL.revokeObjectURL(audioUrl);
 });
 fetch('/api/status').then(r => r.json()).then(info => {
-  modelReady = info.ready; maxSeconds = info.max_seconds; maxFrames = info.max_frames;
+  modelReady = info.ready; maxSeconds = info.max_seconds;
   $('modelInfo').textContent = info.model + ' · ' + info.device;
   status(info.ready ? 'Ready. Start your camera and microphone.' : 'UI-only mode. Restart without --ui-only to chat.');
   controls();
