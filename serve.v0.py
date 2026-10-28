@@ -9,8 +9,8 @@
 """Local camera and voice chat with LiquidAI/LFM3-Omni-2B.
 
 Run after the model download finishes:
-    uv run --python 3.12 serve.py
-    uv run --python 3.12 serve.py --model /path/to/LFM3-Omni-2B
+    uv run --python 3.12 serve.v0.py
+    uv run --python 3.12 serve.v0.py --model /path/to/LFM3-Omni-2B
 
 Then open http://localhost:8000 and allow camera/microphone access. Speech is
 submitted after a pause, together with up to six camera frames from that turn.
@@ -20,6 +20,8 @@ recording pauses during inference and playback. No separate ASR or TTS model.
 Only cached model files are used by default. --download permits Hugging Face
 downloads. Custom model code is loaded with trust_remote_code=True, as required
 by this checkpoint. --ui-only serves the interface without loading weights.
+
+For HTTPS, pass --ssl-certfile cert.pem --ssl-keyfile key.pem.
 
 Model API: https://huggingface.co/LiquidAI/LFM3-Omni-2B
 """
@@ -311,7 +313,7 @@ def create_app(args, engine=None):
 
     @app.get("/", response_class=FileResponse)
     def index():
-        return FileResponse(Path(__file__).with_name("index.html"), media_type="text/html",
+        return FileResponse(Path(__file__).with_name("index.v0.html"), media_type="text/html",
                             headers={"Cache-Control": "no-store"})
 
     @app.get("/api/status")
@@ -355,17 +357,22 @@ def parse_args(argv=None):
     parser.add_argument("--history-turns", type=int, default=3, help="Past camera/audio turns retained per conversation")
     parser.add_argument("--download", action="store_true", help="Allow downloading missing model files")
     parser.add_argument("--ui-only", action="store_true", help="Serve the interface without loading the model")
+    parser.add_argument("--ssl-certfile", help="PEM certificate file for HTTPS")
+    parser.add_argument("--ssl-keyfile", help="PEM private key file for HTTPS")
 
     args = parser.parse_args(argv)
     if not 1 <= args.max_new_tokens <= 8192:
         parser.error("--max-new-tokens must be between 1 and 8192")
     if not 0 <= args.history_turns <= 8:
         parser.error("--history-turns must be between 0 and 8")
+    if bool(args.ssl_certfile) != bool(args.ssl_keyfile):
+        parser.error("Supply both --ssl-certfile and --ssl-keyfile")
     return args
 
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     args = parse_args()
-    LOG.info("Open http://localhost:%s", args.port)
-    uvicorn.run(create_app(args), host=args.host, port=args.port)
+    LOG.info("Open %s://localhost:%s", "https" if args.ssl_certfile else "http", args.port)
+    uvicorn.run(create_app(args), host=args.host, port=args.port,
+                ssl_certfile=args.ssl_certfile, ssl_keyfile=args.ssl_keyfile)
