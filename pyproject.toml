@@ -6,8 +6,10 @@ requires-python = ">=3.12"
 dependencies = [
     "accelerate",
     "fastapi",
+    "huggingface-hub",
     "librosa",
     "numpy",
+    "onnxruntime",
     "pillow",
     "soundfile",
     "torch",
@@ -27,3 +29,6 @@ dev = [
 
 [tool.uv]
 package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

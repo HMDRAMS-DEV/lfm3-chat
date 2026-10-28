@@ -106,7 +106,10 @@ def engine():
 def test_routes_and_valid_media():
     instance = engine()
     with TestClient(serve.create_app(instance.args, instance)) as client:
-        assert "AudioWorkletProcessor" in client.get("/").text
+        assert "/static/app.js" in client.get("/").text
+        assert "AudioWorkletProcessor" in client.get("/static/app.js").text
+        assert client.get("/static/style.css").status_code == 200
+        assert client.get("/static/turn-gate.js").status_code == 200
         assert client.get("/api/status").json()["ready"] is True
         response = client.post("/api/turn", json=payload())
         assert response.status_code == 200, response.text

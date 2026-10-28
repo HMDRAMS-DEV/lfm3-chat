@@ -1,60 +1,18 @@
-<!doctype html>
-<html lang="en">
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>LFM3 video chat</title>
-<style>
-:root { color-scheme: dark; font: 16px/1.5 system-ui, sans-serif; background: #101318; color: #edf1f7 }
-* { box-sizing: border-box } body { margin: 0; padding: 28px; max-width: 1200px; margin-inline: auto }
-h1 { font-size: 26px; margin: 0 } .muted { color: #a4aebd } header { margin-bottom: 22px }
-main { display: grid; grid-template-columns: 1fr 1fr; gap: 22px } .panel { background: #191f28; border: 1px solid #303947; border-radius: 16px; padding: 20px }
-video { width: 100%; aspect-ratio: 4/3; background: #090c10; border-radius: 10px; object-fit: contain; transform: scaleX(-1) }
-.buttons { display: flex; flex-wrap: wrap; gap: 10px; margin: 16px 0 } button { font: inherit; font-weight: 600; padding: 10px 16px; border: 0; border-radius: 8px; cursor: pointer; background: #a8e6c5; color: #10271d }
-button.secondary { background: #313e50; color: #edf1f7 } button:disabled { opacity: .4; cursor: default } button.active { background: #ff9b98; color: #301414 }
-label { display: block; margin-block: 12px } input[type=range] { width: 130px; vertical-align: middle }
-#status { min-height: 28px; font-weight: 600 } #status.error { color: #ffaaa7 } meter { width: 100%; height: 12px }
-#messages { height: 400px; overflow-y: auto; display: flex; flex-direction: column; gap: 14px; padding-bottom: 8px }
-.message { border-radius: 10px; padding: 12px 14px; background: #263449; white-space: pre-wrap; overflow-wrap: anywhere }
-.message.user { background: #263c34; align-self: end } .meta { color: #b3bfd0; font-size: 13px; margin-bottom: 5px }
-audio { max-width: 100%; margin-top: 14px } #play { display: none } .hint { font-size: 14px; color: #a4aebd }
-@media(max-width: 760px) { body { padding: 16px } main { grid-template-columns: 1fr } #messages { height: 260px } }
-</style>
-<header><h1>LFM3 video chat</h1><div class="muted">LiquidAI / LFM3-Omni-2B</div></header>
-<main>
-  <section class="panel" aria-label="Camera and microphone">
-    <video id="camera" autoplay playsinline muted></video>
-    <div class="buttons">
-      <button id="start">Start camera &amp; mic</button>
-      <button id="stop" class="secondary" disabled>Stop</button>
-      <button id="talk" class="secondary" disabled>Speak</button>
-    </div>
-    <div id="status" role="status" aria-live="polite">Checking model...</div>
-    <meter id="level" min="0" max="0.12" value="0" aria-label="Microphone level"></meter>
-    <label><input id="automatic" type="checkbox" checked> Send automatically after a pause</label>
-    <label><input id="bargeIn" type="checkbox"> Allow voice interruption, use headphones</label>
-    <label><input id="useCamera" type="checkbox" checked> Include camera frames</label>
-    <label class="hint">Mic threshold <input id="threshold" type="range" min="0.005" max="0.08" step="0.001" value="0.018"></label>
-    <p class="hint">Speak, then pause for a reply. Audio streams as the model generates it. Click Interrupt &amp; speak to stop the reply and ask another question. Each turn includes up to six camera frames.</p>
-    <p class="hint">Video preview is mirrored. The model sees the original camera image.</p>
-  </section>
-  <section class="panel" aria-label="Conversation">
-    <div id="messages" role="log" aria-live="polite"><p class="muted" id="empty">Your spoken replies will appear here.</p></div>
-    <audio id="reply" controls></audio>
-    <div class="buttons"><button id="clear" class="secondary">New conversation</button></div>
-    <p class="hint" id="modelInfo"></p>
-  </section>
-</main>
-<script>
+
 'use strict';
 const $ = id => document.getElementById(id);
 let sessionId = crypto.randomUUID();
 let stream, context, source, worklet, mute, timer, socket, audioUrl;
 let connected = false, busy = false, recording = false, manual = false, resetting = false;
-let preRoll = [], recordedSamples = 0, frameCount = 0, voiceRun = 0;
+let preRoll = [], recordedSamples = 0, frameCount = 0;
 let lastVoice = 0, resumeAt = 0, modelReady = false, maxSeconds = 30;
 let nextTurn = 0, activeTurn = 0, replyBody, replyMeta, replyChunks = [];
 let playbackAt = 0;
 const playing = new Set();
+const turnGate = new TurnGate();
+let micAnalyser, replyAnalyser, noiseFloor = 0.002, speechWindow = [], speakingSince = 0;
+let waveformFrame;
+let previewMode = false;
 
 function status(text, error = false) {
   $('status').textContent = text;
@@ -76,6 +34,15 @@ function controls() {
   $('talk').textContent = recording ? 'Send' : busy || playing.size || !$('reply').paused ? 'Interrupt & speak' : 'Speak';
   $('talk').classList.toggle('active', recording);
   $('clear').disabled = resetting;
+  const state = $('status').classList.contains('error') ? 'error' : !connected ? 'idle' :
+    recording ? (turnGate.holding ? 'holding' : turnGate.pending ? 'checking' : 'recording') :
+    playing.size ? 'speaking' : busy ? 'thinking' : 'listening';
+  document.body.dataset.state = state;
+  $('stateLabel').textContent = {idle: 'Ready when you are', error: 'Needs attention',
+    recording: 'Listening to you', holding: 'Take your time', checking: 'Checking your pause',
+    speaking: 'Speaking', thinking: 'Thinking', listening: 'Listening'}[state];
+  $('connection').textContent = previewMode ? 'Preview' : connected ? 'Live' : 'Offline';
+  $('cameraPlaceholder').hidden = connected && !!stream?.getVideoTracks().length && $('useCamera').checked;
 }
 function listening() {
   if (connected && !busy && !recording && !playing.size && $('reply').paused) {
@@ -89,7 +56,8 @@ function send(event) {
   socket.send(event instanceof ArrayBuffer ? event : JSON.stringify(event));
 }
 function clearRecording() {
-  recording = false; manual = false; preRoll = []; recordedSamples = 0; frameCount = 0; voiceRun = 0;
+  recording = false; manual = false; preRoll = []; recordedSamples = 0; frameCount = 0;
+  turnGate.reset(); speechWindow = [];
   controls();
 }
 function stopPlayback() {
@@ -128,33 +96,50 @@ function beginTurn(isManual) {
   send({type: 'start', id: activeTurn, session_id: sessionId});
   clearReplay(); replyBody = replyMeta = null;
   recording = true; manual = isManual; recordedSamples = 0; frameCount = 0;
+  turnGate.reset();
   const prior = preRoll; preRoll = [];
   for (const samples of prior) sendSamples(samples);
-  lastVoice = performance.now(); voiceRun = 0;
+  lastVoice = performance.now();
   captureFrame(); status('Recording...'); controls();
 }
 function onSamples(samples) {
   let sum = 0; for (const x of samples) sum += x * x;
   const rms = Math.sqrt(sum / samples.length); $('level').value = rms;
   if (!connected || resetting) return;
-  const now = performance.now(), voiced = rms >= Number($('threshold').value);
+  const now = performance.now();
+  const threshold = Math.max(Number($('threshold').value), noiseFloor * 3);
+  const voiced = rms >= threshold;
+  if (!recording && !busy && !playing.size && !voiced) noiseFloor = noiseFloor * 0.98 + rms * 0.02;
   if (!recording) {
     const answering = busy || playing.size || !$('reply').paused;
     if (answering && !$('bargeIn').checked) { preRoll = []; return; }
     if (!answering && now < resumeAt) { preRoll = []; return; }
-    voiceRun = voiced ? voiceRun + samples.length / 16 : 0;
-    if ($('automatic').checked && voiced && (!answering || voiceRun >= 200)) beginTurn(false);
+    speechWindow.push(voiced ? 1 : 0);
+    if (speechWindow.length > 8) speechWindow.shift();
+    const sustained = speechWindow.reduce((a, b) => a + b, 0) >= 6;
+    // Ignore the first echo burst when playback starts; manual interruption
+    // always remains available. A rolling window tolerates consonant gaps.
+    const canInterrupt = !playing.size || now - speakingSince > 600;
+    if ($('automatic').checked && voiced && (!answering || sustained && canInterrupt)) beginTurn(false);
     else {
       preRoll.push(samples);
-      while (preRoll.length > 4) preRoll.shift();
+      while (preRoll.length > 8) preRoll.shift();
       return;
     }
   }
   try {
     sendSamples(samples);
-    if (voiced) lastVoice = now;
-    if (recordedSamples >= 16000 * (maxSeconds - 0.1) ||
-        (!manual && now - lastVoice >= 900 && recordedSamples > 8000)) commitTurn();
+    if (voiced) {
+      const wasWaiting = turnGate.pending !== null || turnGate.holding;
+      lastVoice = now; turnGate.voiced();
+      if (wasWaiting) { status('Recording...'); controls(); }
+    }
+    if (recordedSamples >= 16000 * (maxSeconds - 0.1)) commitTurn();
+    else if (!manual) {
+      const action = turnGate.update(now - lastVoice, recordedSamples / 16);
+      if (action?.type === 'commit') commitTurn();
+      else if (action?.type === 'pause') { send(action); status('Checking your pause...'); controls(); }
+    }
   } catch (error) { failConnection(error); }
 }
 function commitTurn() {
@@ -180,7 +165,8 @@ function playChunk(packet) {
   const pcm = new Uint8Array(packet.slice(4)); replyChunks.push(pcm);
   const buffer = context.createBuffer(1, pcm.length / 2, 24000), data = buffer.getChannelData(0);
   for (let i = 0; i < data.length; i++) data[i] = view.getInt16(4 + i * 2, true) / 32768;
-  const node = context.createBufferSource(); node.buffer = buffer; node.connect(context.destination);
+  const node = context.createBufferSource(); node.buffer = buffer; node.connect(replyAnalyser);
+  if (!playing.size) speakingSince = performance.now();
   playbackAt = Math.max(playbackAt, context.currentTime + 0.04);
   playing.add(node); node.start(playbackAt); playbackAt += buffer.duration;
   node.onended = () => {
@@ -216,10 +202,19 @@ async function connectSocket() {
           clearTimeout(timeout);
           if (!data.ready) reject(new Error('Model is not loaded. Restart without --ui-only.'));
           else if (data.input_rate !== 16000 || data.output_rate !== 24000) reject(new Error('Unsupported audio sample rate.'));
-          else resolve();
+          else {
+            turnGate.configure(data.turn_detector || 'silence', data.pause_ms || 900, data.hold_ms || 2500);
+            $('turnInfo').textContent = data.turn_detector === 'smart-turn-v3' ? 'Smart Turn v3' : 'Silence detection';
+            resolve();
+          }
           return;
         }
         if (data.id !== activeTurn) return;
+        if (data.type === 'turn_decision' && recording && !manual) {
+          const accepted = turnGate.pending === data.check;
+          if (turnGate.decide(data.check, data.complete)) commitTurn();
+          else if (accepted) { status('Take your time. Still listening...'); controls(); }
+        }
         if (data.type === 'text') { ensureReply(); replyBody.textContent = data.text; }
         if (data.type === 'generating') status('Model is thinking...');
         if (data.type === 'done') {
@@ -248,7 +243,7 @@ function failConnection(error) {
 }
 const workletCode = `
 class MicCapture extends AudioWorkletProcessor {
-  constructor() { super(); this.buffer = new Float32Array(1024); this.at = 0; }
+  constructor() { super(); this.buffer = new Float32Array(512); this.at = 0; }
   process(inputs) {
     const channels = inputs[0];
     if (channels && channels.length) {
@@ -257,7 +252,7 @@ class MicCapture extends AudioWorkletProcessor {
         this.buffer[this.at++] = value / channels.length;
         if (this.at === this.buffer.length) {
           this.port.postMessage(this.buffer, [this.buffer.buffer]);
-          this.buffer = new Float32Array(1024); this.at = 0;
+          this.buffer = new Float32Array(512); this.at = 0;
         }
       }
     }
@@ -281,6 +276,9 @@ $('start').onclick = async () => {
     const moduleUrl = URL.createObjectURL(new Blob([workletCode], {type: 'text/javascript'}));
     try { await context.audioWorklet.addModule(moduleUrl); } finally { URL.revokeObjectURL(moduleUrl); }
     source = context.createMediaStreamSource(stream); worklet = new AudioWorkletNode(context, 'mic-capture');
+    micAnalyser = context.createAnalyser(); micAnalyser.fftSize = 256; source.connect(micAnalyser);
+    replyAnalyser = context.createAnalyser(); replyAnalyser.fftSize = 256; replyAnalyser.connect(context.destination);
+    noiseFloor = 0.002;
     worklet.port.onmessage = event => {
       try { onSamples(event.data); } catch (error) { failConnection(error); }
     };
@@ -297,6 +295,7 @@ async function stopMedia() {
   const target = socket; socket = null; target?.close();
   if (worklet) { worklet.port.onmessage = null; worklet.disconnect(); }
   source?.disconnect(); mute?.disconnect();
+  micAnalyser?.disconnect(); replyAnalyser?.disconnect(); micAnalyser = replyAnalyser = null;
   for (const track of stream?.getTracks() || []) { track.onended = null; track.stop(); }
   stream = null; $('camera').srcObject = null; stopPlayback();
   const previous = context; context = null;
@@ -311,6 +310,8 @@ $('talk').onclick = () => {
 };
 $('automatic').onchange = () => { if (!recording) listening(); };
 $('useCamera').onchange = () => {
+  for (const track of stream?.getVideoTracks() || []) track.enabled = $('useCamera').checked;
+  controls();
   if (connected && $('useCamera').checked && !stream.getVideoTracks().length) status('Stop and restart to enable the camera.');
 };
 $('reply').onplay = () => {
@@ -335,14 +336,38 @@ $('clear').onclick = async () => {
   } catch (error) { resetting = false; status(error.message, true); controls(); }
 };
 window.addEventListener('pagehide', () => {
+  cancelAnimationFrame(waveformFrame);
   socket?.close(); for (const track of stream?.getTracks() || []) track.stop();
   if (audioUrl) URL.revokeObjectURL(audioUrl);
 });
 fetch('/api/status').then(r => r.json()).then(info => {
   modelReady = info.ready; maxSeconds = info.max_seconds;
+  previewMode = !!info.preview; $('previewNotice').hidden = !previewMode;
   $('modelInfo').textContent = info.model + ' · ' + info.device;
   status(info.ready ? 'Ready. Start your camera and microphone.' : 'UI-only mode. Restart without --ui-only to chat.');
   controls();
 }).catch(error => status('Cannot reach server: ' + error.message, true));
-</script>
-</html>
+
+// The waveform follows the microphone while listening and the actual scheduled
+// reply audio while speaking. It needs no external fonts or browser model CDN.
+const waveform = $('waveform'), drawing = waveform.getContext('2d');
+function drawWaveform() {
+  const width = waveform.clientWidth, height = waveform.clientHeight, ratio = window.devicePixelRatio || 1;
+  if (waveform.width !== Math.round(width * ratio) || waveform.height !== Math.round(height * ratio)) {
+    waveform.width = Math.round(width * ratio); waveform.height = Math.round(height * ratio);
+  }
+  drawing.setTransform(ratio, 0, 0, ratio, 0, 0); drawing.clearRect(0, 0, width, height);
+  const analyser = playing.size ? replyAnalyser : micAnalyser;
+  const bins = analyser ? new Uint8Array(analyser.frequencyBinCount) : null;
+  if (bins) analyser.getByteFrequencyData(bins);
+  drawing.fillStyle = getComputedStyle(document.body).getPropertyValue('--accent').trim();
+  const count = 44, gap = 4, barWidth = Math.max(2, (width - gap * (count - 1)) / count);
+  for (let i = 0; i < count; i++) {
+    const amplitude = bins ? bins[Math.floor(i * bins.length * 0.65 / count)] / 255 : 0;
+    const barHeight = Math.max(3, amplitude * height * 0.9);
+    drawing.globalAlpha = 0.35 + amplitude * 0.65;
+    drawing.beginPath(); drawing.roundRect(i * (barWidth + gap), (height - barHeight) / 2, barWidth, barHeight, 2); drawing.fill();
+  }
+  drawing.globalAlpha = 1; waveformFrame = requestAnimationFrame(drawWaveform);
+}
+drawWaveform();

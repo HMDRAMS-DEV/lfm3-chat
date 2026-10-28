@@ -1,49 +1,142 @@
 # LFM3 video chat
 
-Install the locked dependencies:
+Talk to [LFM3-Omni-2B](https://huggingface.co/LiquidAI/LFM3-Omni-2B) through your
+microphone and camera. The model replies with text and audio, and you can
+interrupt it by speaking or pressing a button.
+
+Run the server on your own computer and open the chat in a browser. You can also
+connect from a laptop or phone over HTTPS. A supported GPU on the server is
+recommended for conversation speed.
+
+## Get started
+
+You need [uv](https://docs.astral.sh/uv/) and a microphone. The project uses Python
+3.12. Run these commands from the project folder on the computer hosting the model.
+
+Install the dependencies:
 
 ```bash
 uv sync --locked
 ```
 
-Run with HTTPS:
+Already downloaded the model? Skip the next command and use your existing folder
+with `--model`. Otherwise, download it once:
 
-To create a self-signed certificate for localhost:
+```bash
+uv run hf download LiquidAI/LFM3-Omni-2B --local-dir resources/models/lfm3-omni-2b
+```
+
+Start the chat, replacing the model path if needed:
+
+```bash
+uv run --python 3.12 serve.py --model resources/models/lfm3-omni-2b
+```
+
+Open http://localhost:8000 on the same computer. HTTPS is not needed for localhost.
+The server uses existing model files by default; `--download` allows it to fetch
+missing files. If your model is already in the Hugging Face cache, you can omit
+`--model`.
+
+## Have a conversation
+
+1. Click **Start conversation** and allow microphone and camera access.
+2. Speak, then pause for a reply. Audio plays as the model generates it.
+3. Speak over a reply to interrupt it, or click **Interrupt & speak**. Headphones
+   help prevent speaker echo from causing unwanted interruptions.
+4. Open **Conversation settings** to turn camera sharing or hands-free speech on
+   or off, or adjust the microphone threshold.
+5. Click **End** to stop the camera and microphone. **Start fresh** clears the
+   conversation history.
+
+The assistant begins answering after your turn ends. It does not generate an
+answer while you are still speaking.
+
+## Pause to think with Smart Turn
+
+Smart Turn v3.2 helps distinguish a thinking pause from the end of a sentence.
+To enable it and download any missing model files on the first run:
+
+```bash
+uv run --python 3.12 serve.py \
+  --model resources/models/lfm3-omni-2b \
+  --turn-detector smart --download
+```
+
+After that, omit `--download`. The default `auto` setting uses Smart Turn when it
+is available locally and falls back to silence detection otherwise. You can
+choose silence detection explicitly with `--turn-detector silence`.
+
+Smart Turn runs on the CPU. It gives you time to continue an unfinished thought,
+with a short silence timeout so the conversation does not stay waiting forever.
+You can always press **Send** to finish your turn immediately.
+
+Its model is kept in `resources/models/smart-turn-v3/`. Keep that folder to reuse
+the download. Deleting it removes the local model copy. For an existing ONNX file,
+use `--turn-model /path/to/smart-turn-v3.2-cpu.onnx`.
+
+## Connect from another device
+
+For camera and microphone access from a laptop or phone, use HTTPS. Start the
+server with `--host 0.0.0.0` so it accepts connections from your local network.
+
+Use a certificate trusted by the connecting device. For development, you can
+create a self-signed certificate. Replace `192.168.0.124` below with your server's
+LAN address if different:
 
 ```bash
 openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
   -keyout key.pem -out cert.pem -subj "/CN=localhost" \
-  -addext "subjectAltName=DNS:localhost,IP:127.0.0.1,IP:::1"
+  -addext "subjectAltName=DNS:localhost,IP:127.0.0.1,IP:192.168.0.124"
 chmod 600 key.pem
 ```
 
-Start the server, then accept the self-signed certificate when opening the page:
+Then run:
 
 ```bash
 uv run --python 3.12 serve.py \
+  --model resources/models/lfm3-omni-2b \
+  --host 0.0.0.0 --port 8888 \
   --ssl-certfile cert.pem \
   --ssl-keyfile key.pem
 ```
 
-Open https://localhost:8000 and allow camera and microphone access. Supply your
-certificate and private key at those paths. Use a certificate trusted by the
-browser. The page connects over a secure WebSocket automatically.
+Trust the certificate on the connecting device, then open
+https://192.168.0.124:8888/ there. The browser automatically uses a secure WebSocket
+for audio and video frames. If the page cannot connect, check that the server's
+firewall allows your chosen port.
 
-For HTTP on localhost:
+Both certificate flags are required together. `cert.pem` and `key.pem` are ignored
+by Git. Never share the private key.
 
-```bash
-uv run --python 3.12 serve.py
-```
+## Development checks and preview
 
-The model loads from the Hugging Face cache by default. Use `--model /path/to/model`
-for a local directory, or `--download` to allow downloading missing model files.
-
-The browser streams microphone audio and camera frames while you speak. After a
-pause, the model processes the utterance and streams back text and speech. Use
-**Interrupt & speak** to stop a reply, or enable voice interruption with headphones.
-
-Run the tests:
+Run the local tests:
 
 ```bash
 uv run pytest
+node --test tests/test-turn-gate.cjs
 ```
+
+Preview the interface without loading LFM3 weights:
+
+```bash
+uv run --python 3.12 tests/live_fixture.py --port 8001
+```
+
+Open http://localhost:8001. The preview is labelled and uses fixed text, synthetic
+audio, and scripted turn decisions. It demonstrates the interface and interaction
+flow, not the model's response quality or speed.
+
+To check loading and inference of the real Smart Turn model:
+
+```bash
+uv run --python 3.12 tests/check_smart_turn.py
+```
+
+This check downloads the classifier if missing and tests it on silence. It does
+not measure accuracy on real speech. On their first run, `uv` may also install the
+check scripts' Python dependencies.
+
+Both scripts are saved under `tests/`. Downloaded model assets are kept under
+`resources/`, which is ignored by Git. Your own LFM3 folder can be anywhere; pass
+its path with `--model`.

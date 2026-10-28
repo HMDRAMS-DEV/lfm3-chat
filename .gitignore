@@ -6,3 +6,5 @@ __pycache__
 /key.pem
 resources
 *.bak*
+tmp/
+backup

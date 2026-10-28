@@ -10,7 +10,8 @@ streams 16 kHz PCM microphone packets and camera frames to the server. After a
 pause, the model answers with streamed text and 24 kHz PCM audio. Click Interrupt
 & speak to stop a reply, or enable voice interruption when using headphones.
 The model processes each completed utterance; incoming audio is buffered until
-the pause. No separate ASR or TTS model.
+the turn ends. Smart Turn v3 can hold thinking pauses without cutting you off.
+No separate ASR or TTS model.
 
 Only cached model files are used by default. --download permits Hugging Face
 downloads. Custom model code is loaded with trust_remote_code=True, as required
@@ -19,6 +20,10 @@ by this checkpoint. --ui-only serves the interface without loading weights.
 To serve HTTPS, pass --ssl-certfile cert.pem --ssl-keyfile key.pem. Use a
 certificate trusted by the browser when accessing the camera from another device.
 The browser automatically uses a secure WebSocket when the page uses HTTPS.
+
+Use --turn-detector smart --download once to fetch Smart Turn v3.2 into
+resources/models/smart-turn-v3/. Later runs reuse it without downloading.
+The default auto mode uses cached Smart Turn, or falls back to silence detection.
 
 Model API: https://huggingface.co/LiquidAI/LFM3-Omni-2B
 """
@@ -46,7 +51,10 @@ from pathlib import Path
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
+
+from turn_detection import load_turn_detector
 
 LOG = logging.getLogger("lfm3")
 INPUT_RATE = 16_000
@@ -237,6 +245,7 @@ class Engine:
         self.lock = threading.Lock()
         self.sessions: OrderedDict[str, Session] = OrderedDict()
         self.ready = False
+        self.turn_detector = None
         self.device = "unloaded"
 
     def load(self):
@@ -263,6 +272,7 @@ class Engine:
         self.codec = self.processor.audio_tokenizer.to(device=device).eval()
         self.codec_cache_class = importlib.import_module(type(self.codec).__module__).LiquidCodecStreamingCache
         self.context_length = getattr(self.model.config, "max_position_embeddings", 32768)
+        self.turn_detector = load_turn_detector(self.args)
         self.ready = True
         LOG.info("Model ready")
 
@@ -407,13 +417,17 @@ async def serve_live(websocket: WebSocket, engine: Engine):
             return
     await websocket.accept()
     await websocket.send_json({"type": "ready", "ready": engine.ready,
-                               "input_rate": INPUT_RATE, "output_rate": OUTPUT_RATE})
+                               "input_rate": INPUT_RATE, "output_rate": OUTPUT_RATE,
+                               "turn_detector": "smart-turn-v3" if engine.turn_detector else "silence",
+                               "pause_ms": 250 if engine.turn_detector else 900,
+                               "hold_ms": 2500})
     if not engine.ready:
         await websocket.close(code=1000)
         return
     queue = asyncio.Queue(maxsize=32)
     loop = asyncio.get_running_loop()
     worker, cancelled, recording, turn_id = None, threading.Event(), None, 0
+    decision_task = None
 
     async def sender():
         while True:
@@ -464,6 +478,20 @@ async def serve_live(websocket: WebSocket, engine: Engine):
         if worker:
             await worker
 
+    async def check_turn(data, reply_id, check_id, pcm):
+        started = time.monotonic()
+        try:
+            probability = await run_in_threadpool(engine.turn_detector.predict, pcm)
+            complete = probability >= engine.args.turn_threshold
+        except Exception:
+            LOG.exception("Turn detection failed; falling back to silence timeout")
+            probability, complete = None, False
+        # A continuation, reset, or cancellation invalidates this decision.
+        if recording is data and data["check"] == check_id:
+            await queue.put({"type": "turn_decision", "id": reply_id, "check": check_id,
+                             "complete": complete, "probability": probability,
+                             "milliseconds": round((time.monotonic() - started) * 1000)})
+
     writer = asyncio.create_task(sender())
     try:
         while True:
@@ -501,7 +529,7 @@ async def serve_live(websocket: WebSocket, engine: Engine):
                         await run_in_threadpool(engine.reset, event["session_id"])
                         await queue.put({"type": "reset", "id": turn_id})
                     else:
-                        recording = {"session_id": event["session_id"], "pcm": bytearray(), "frames": [], "size": 0}
+                        recording = {"session_id": event["session_id"], "pcm": bytearray(), "frames": [], "size": 0, "check": 0}
                 elif kind == "cancel":
                     cancelled.set()
                     recording = None
@@ -512,6 +540,23 @@ async def serve_live(websocket: WebSocket, engine: Engine):
                     if recording["size"] > MAX_BODY or len(recording["frames"]) >= 64:
                         raise ValueError("Too many camera frames.")
                     recording["frames"].append({"time": event.get("time"), "image": event.get("image")})
+                elif kind == "pause":
+                    if recording is None or engine.turn_detector is None:
+                        continue
+                    check_id = event.get("check")
+                    if (isinstance(check_id, bool) or not isinstance(check_id, int)
+                            or not recording["check"] < check_id <= 1000):
+                        raise ValueError("Invalid turn check.")
+                    recording["check"] = check_id
+                    if len(recording["pcm"]) < INPUT_RATE // 5:
+                        continue
+                    if decision_task:
+                        decision_task.cancel()
+                    # Only the last eight seconds are needed; GPU generation can
+                    # continue independently while this CPU classifier runs.
+                    decision_task = asyncio.create_task(check_turn(
+                        recording, turn_id, check_id, bytes(recording["pcm"][-INPUT_RATE * 16:]),
+                    ))
                 elif kind == "commit":
                     if recording is None:
                         raise ValueError("Start a recording before committing it.")
@@ -536,6 +581,9 @@ async def serve_live(websocket: WebSocket, engine: Engine):
         pass
     finally:
         cancelled.set()
+        if decision_task:
+            decision_task.cancel()
+            await asyncio.gather(decision_task, return_exceptions=True)
         writer.cancel()
         await asyncio.gather(writer, return_exceptions=True)
         if worker:
@@ -558,6 +606,7 @@ def create_app(args, engine=None):
 
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None)
     app.state.engine = engine
+    app.mount("/static", StaticFiles(directory=Path(__file__).with_name("web")), name="static")
 
     @app.get("/", response_class=FileResponse)
     def index():
@@ -567,7 +616,9 @@ def create_app(args, engine=None):
     @app.get("/api/status")
     def status():
         return {"ready": engine.ready, "model": args.model, "device": engine.device,
-                "max_seconds": MAX_SECONDS, "max_frames": MAX_FRAMES}
+                "max_seconds": MAX_SECONDS, "max_frames": MAX_FRAMES,
+                "preview": getattr(engine, "preview", False),
+                "turn_detector": "smart-turn-v3" if engine.turn_detector else "silence"}
 
     @app.websocket("/api/live")
     async def live(websocket: WebSocket):
@@ -609,6 +660,10 @@ def parse_args(argv=None):
     parser.add_argument("--ui-only", action="store_true", help="Serve the interface without loading the model")
     parser.add_argument("--ssl-certfile", help="PEM certificate file for HTTPS")
     parser.add_argument("--ssl-keyfile", help="PEM private key file for HTTPS")
+    parser.add_argument("--turn-detector", choices=["auto", "smart", "silence"], default="auto",
+                        help="Use cached Smart Turn if available, require it, or use silence only")
+    parser.add_argument("--turn-model", help="Local Smart Turn v3.2 ONNX file")
+    parser.add_argument("--turn-threshold", type=float, default=0.5, help="Smart Turn completion probability threshold")
 
     args = parser.parse_args(argv)
     if not 1 <= args.max_new_tokens <= 8192:
@@ -617,6 +672,10 @@ def parse_args(argv=None):
         parser.error("--history-turns must be between 0 and 8")
     if bool(args.ssl_certfile) != bool(args.ssl_keyfile):
         parser.error("Supply both --ssl-certfile and --ssl-keyfile")
+    if not 0 < args.turn_threshold < 1:
+        parser.error("--turn-threshold must be between 0 and 1")
+    if args.turn_model and args.turn_detector == "silence":
+        parser.error("--turn-model cannot be combined with --turn-detector silence")
     return args
 
 
