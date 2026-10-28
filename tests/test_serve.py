@@ -7,14 +7,43 @@ import wave
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import serve
+
+
+def test_console_entry_point_passes_model_and_https_options_to_server(monkeypatch):
+    run = Mock()
+    monkeypatch.setattr(serve.uvicorn, "run", run)
+    serve.main(
+        [
+            "--ui-only",
+            "--model",
+            "/existing/model",
+            "--host",
+            "0.0.0.0",
+            "--port",
+            "8888",
+            "--ssl-certfile",
+            "cert.pem",
+            "--ssl-keyfile",
+            "key.pem",
+        ]
+    )
+    assert run.call_count == 1
+    assert run.call_args.kwargs == {
+        "host": "0.0.0.0",
+        "port": 8888,
+        "ssl_certfile": "cert.pem",
+        "ssl_keyfile": "key.pem",
+    }
+    assert run.call_args.args[0].state.engine.args.model == "/existing/model"
 
 
 def recording(seconds=1, rate=16000):

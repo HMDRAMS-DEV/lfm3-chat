@@ -2,8 +2,8 @@
 """Local camera and voice chat with LiquidAI/LFM3-Omni-2B.
 
 Run after the model download finishes:
-    uv run serve.py
-    uv run serve.py --model /path/to/LFM3-Omni-2B
+    uv run serve
+    uv run serve --model /path/to/LFM3-Omni-2B
 
 Then open http://localhost:8000 and allow camera/microphone access. A WebSocket
 streams 16 kHz PCM microphone packets and camera frames to the server. After a
@@ -606,11 +606,12 @@ def create_app(args, engine=None):
 
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None)
     app.state.engine = engine
-    app.mount("/static", StaticFiles(directory=Path(__file__).with_name("web")), name="static")
+    web_directory = Path(__file__).resolve().parent / "web"
+    app.mount("/static", StaticFiles(directory=web_directory / "static"), name="static")
 
     @app.get("/", response_class=FileResponse)
     def index():
-        return FileResponse(Path(__file__).with_name("index.html"), media_type="text/html",
+        return FileResponse(web_directory / "index.html", media_type="text/html",
                             headers={"Cache-Control": "no-store"})
 
     @app.get("/api/status")
@@ -679,9 +680,13 @@ def parse_args(argv=None):
     return args
 
 
-if __name__ == "__main__":
+def main(argv=None):
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
-    args = parse_args()
+    args = parse_args(argv)
     LOG.info("Open %s://localhost:%s", "https" if args.ssl_certfile else "http", args.port)
     uvicorn.run(create_app(args), host=args.host, port=args.port,
                 ssl_certfile=args.ssl_certfile, ssl_keyfile=args.ssl_keyfile)
+
+
+if __name__ == "__main__":
+    main()

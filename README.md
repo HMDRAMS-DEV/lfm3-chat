@@ -29,7 +29,7 @@ uv run hf download LiquidAI/LFM3-Omni-2B --local-dir resources/models/lfm3-omni-
 Start the chat, replacing the model path if needed:
 
 ```bash
-uv run --python 3.12 serve.py --model resources/models/lfm3-omni-2b
+uv run serve --model resources/models/lfm3-omni-2b
 ```
 
 Open http://localhost:8000 on the same computer. HTTPS is not needed for localhost.
@@ -57,7 +57,7 @@ Smart Turn v3.2 helps distinguish a thinking pause from the end of a sentence.
 To enable it and download any missing model files on the first run:
 
 ```bash
-uv run --python 3.12 serve.py \
+uv run serve \
   --model resources/models/lfm3-omni-2b \
   --turn-detector smart --download
 ```
@@ -93,7 +93,7 @@ chmod 600 key.pem
 Then run:
 
 ```bash
-uv run --python 3.12 serve.py \
+uv run serve \
   --model resources/models/lfm3-omni-2b \
   --host 0.0.0.0 --port 8888 \
   --ssl-certfile cert.pem \

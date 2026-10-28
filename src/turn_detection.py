@@ -15,7 +15,12 @@ from pathlib import Path
 LOG = logging.getLogger("lfm3.turns")
 MODEL_ID = "pipecat-ai/smart-turn-v3"
 MODEL_FILE = "smart-turn-v3.2-cpu.onnx"
-MODEL_DIR = Path(__file__).resolve().parent / "resources" / "models" / "smart-turn-v3"
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if not (PROJECT_ROOT / "pyproject.toml").is_file():
+    # A wheel installation has no checkout next to its modules. In that case,
+    # retain downloaded models in the directory where the command was started.
+    PROJECT_ROOT = Path.cwd()
+MODEL_DIR = PROJECT_ROOT / "resources" / "models" / "smart-turn-v3"
 SAMPLE_RATE = 16000
 WINDOW_SAMPLES = SAMPLE_RATE * 8
 

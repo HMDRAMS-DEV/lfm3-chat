@@ -8,11 +8,19 @@ import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from test_serve import streaming_engine
 
 import serve
 import turn_detection
+
+
+def test_default_model_directory_stays_in_project_resources():
+    project_root = Path(__file__).resolve().parents[1]
+    assert (
+        turn_detection.MODEL_DIR
+        == project_root / "resources" / "models" / "smart-turn-v3"
+    )
 
 
 def begin(ws, turn_id=1):
