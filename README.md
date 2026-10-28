@@ -11,6 +11,8 @@ An [ONNX version](src-onnx/README.md) is available in `src-onnx/`, with a separa
 uv environment. Use `q4` for CPU or `q4f16` for NVIDIA GPU. It supports the same
 camera, voice, and interruption controls without installing PyTorch.
 
+To download ONNX weights separately, use the [bundle download commands](src-onnx/README.md#download-without-starting-the-server).
+
 ## Get started
 
 You need [uv](https://docs.astral.sh/uv/) and a microphone. The project uses Python
@@ -79,17 +81,18 @@ use `--turn-model /path/to/smart-turn-v3.2-cpu.onnx`.
 
 ## Connect from another device
 
-For camera and microphone access from a laptop or phone, use HTTPS. Start the
-server with `--host 0.0.0.0` so it accepts connections from your local network.
+To connect from another device, use HTTPS for camera and microphone access.
+Start the server with `--host 0.0.0.0` to accept local network connections.
+This setup is optional; local use on http://localhost:8000 needs no certificate.
 
 Use a certificate trusted by the connecting device. For development, you can
-create a self-signed certificate. Replace `192.168.0.124` below with your server's
-LAN address if different:
+create a self-signed certificate. Replace `<server-ip>` below with your server's
+LAN address before running the command:
 
 ```bash
 openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
   -keyout key.pem -out cert.pem -subj "/CN=localhost" \
-  -addext "subjectAltName=DNS:localhost,IP:127.0.0.1,IP:192.168.0.124"
+  -addext "subjectAltName=DNS:localhost,IP:127.0.0.1,IP:<server-ip>"
 chmod 600 key.pem
 ```
 
@@ -98,13 +101,13 @@ Then run:
 ```bash
 uv run serve \
   --model resources/models/lfm3-omni-2b \
-  --host 0.0.0.0 --port 8888 \
+  --host 0.0.0.0 --port 8000 \
   --ssl-certfile cert.pem \
   --ssl-keyfile key.pem
 ```
 
 Trust the certificate on the connecting device, then open
-https://192.168.0.124:8888/ there. The browser automatically uses a secure WebSocket
+https://<server-ip>:8000/ there. The browser automatically uses a secure WebSocket
 for audio and video frames. If the page cannot connect, check that the server's
 firewall allows your chosen port.
 

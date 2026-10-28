@@ -54,6 +54,54 @@ kernel required by these graphs. Use q4f16 for GPU execution.
 `--device auto --precision auto` chooses q4f16 when the CUDA provider is available,
 otherwise q4. Explicit `--device cuda` fails if CUDA cannot load.
 
+## Download without starting the server
+
+The server's `--download` option is a flag, not a path argument. It uses
+`resources/models/lfm3-omni-2b-onnx/` as its download folder.
+
+To download separately, choose one of these commands. They use
+[`hf download`](https://huggingface.co/docs/huggingface_hub/guides/cli#download-files)
+through [`uvx`](https://docs.astral.sh/uv/guides/tools/) and fetch only the files
+needed for the selected bundle.
+
+CPU q4:
+
+```sh
+uvx --python 3.12 --from huggingface-hub hf download LiquidAI/LFM3-Omni-2B-ONNX \
+  config.json processor_config.json tokenizer.json tokenizer_config.json \
+  chat_template.jinja audio_tokenizer/config.json generation_config.json README.md \
+  onnx/decoder_q4.onnx onnx/decoder_q4.onnx_data \
+  onnx/vision_encoder_q8.onnx onnx/vision_encoder_q8.onnx_data \
+  onnx/audio_encoder.onnx onnx/audio_encoder.onnx_data \
+  onnx/depth_decoder.onnx onnx/depth_decoder.onnx_data \
+  onnx/codec_decoder.onnx onnx/codec_decoder.onnx_data \
+  --local-dir resources/models/lfm3-omni-2b-onnx
+```
+
+NVIDIA GPU q4f16:
+
+```sh
+uvx --python 3.12 --from huggingface-hub hf download LiquidAI/LFM3-Omni-2B-ONNX \
+  config.json processor_config.json tokenizer.json tokenizer_config.json \
+  chat_template.jinja audio_tokenizer/config.json generation_config.json README.md \
+  onnx/decoder_q4f16.onnx onnx/decoder_q4f16.onnx_data \
+  onnx/vision_encoder_fp16.onnx onnx/vision_encoder_fp16.onnx_data \
+  onnx/audio_encoder_fp16.onnx onnx/audio_encoder_fp16.onnx_data \
+  onnx/depth_decoder.onnx onnx/depth_decoder.onnx_data \
+  onnx/codec_decoder_fp16.onnx onnx/codec_decoder_fp16.onnx_data \
+  --local-dir resources/models/lfm3-omni-2b-onnx
+```
+
+Change `--local-dir` to choose a different destination. After downloading,
+start the server without `--download`. If you changed the destination, point
+`--model` to that folder. For example, after downloading q4 to
+`resources/models/lfm3-omni-2b-onnx/`:
+
+```sh
+uv run --project src-onnx --python 3.12 --extra cpu serve \
+  --device cpu --precision q4 --model resources/models/lfm3-omni-2b-onnx
+```
+
 ## Model storage
 
 Downloads stay in `resources/models/lfm3-omni-2b-onnx/`. The server fetches only
